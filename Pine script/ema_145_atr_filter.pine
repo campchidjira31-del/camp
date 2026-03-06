@@ -1,0 +1,188 @@
+// ════════════════════════════════════════════════════════════
+// EMA 145 + ATR Filter — Always-In-Market (Filtered)
+// ════════════════════════════════════════════════════════════
+// Strategy:
+//   - Close > EMA 145 → LONG  + ปิด SHORT
+//   - Close < EMA 145 → SHORT + ปิด LONG
+//   - ATR Filter: ATR(14) > SMA(ATR, 60) × 0.9
+//     ถ้า ATR ต่ำเกินไป → ปิด position (exit to flat)
+//     ถ้า ATR ผ่าน + EMA cross → เข้า position
+//
+// Entry: Open แท่งถัดไปหลัง signal
+// Exit:  Opposite signal (flip) หรือ ATR filter หลุด
+// ════════════════════════════════════════════════════════════
+
+//@version=5
+strategy("EMA 145 + ATR Filter",
+     overlay        = true,
+     initial_capital = 2500,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     pyramiding     = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = false)
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            SETTINGS ปรับตรงนี้               ║
+// ╚═════════════════════════════════════════════╝
+
+// ── EMA ──
+ema_period   = input.int(145,   "EMA Period",        minval=1)
+
+// ── ATR Filter ──
+atr_enabled  = input.bool(true, "ATR Filter Enabled")
+atr_period   = input.int(14,    "ATR Period",        minval=1)
+atr_ma_period= input.int(60,    "ATR MA Period",     minval=1)
+atr_mult     = input.float(0.9, "ATR Multiplier",    minval=0.1, step=0.1)
+
+// ── Date Range ──
+use_date     = input.bool(false, "Use Date Filter")
+start_date   = input.time(timestamp("2022-01-01"), "Start Date")
+end_date     = input.time(timestamp("2026-01-01"), "End Date")
+
+// ── Visual ──
+show_atr_bg  = input.bool(true, "Show ATR Zone Background")
+show_labels  = input.bool(true, "Show Signal Labels")
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            INDICATORS                        ║
+// ╚═════════════════════════════════════════════╝
+
+// EMA
+ema_val = ta.ema(close, ema_period)
+
+// ATR + ATR MA
+atr_val = ta.atr(atr_period)
+atr_ma  = ta.sma(atr_val, atr_ma_period)
+atr_threshold = atr_ma * atr_mult
+
+// ATR filter pass/fail
+atr_pass = atr_enabled ? (atr_val > atr_threshold) : true
+
+// Date filter
+in_date_range = use_date ? (time >= start_date and time <= end_date) : true
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            SIGNAL LOGIC                      ║
+// ╚═════════════════════════════════════════════╝
+
+// EMA direction
+ema_long  = close > ema_val
+ema_short = close < ema_val
+
+// Direction change (crossover)
+cross_long  = ema_long  and not ema_long[1]   // เพิ่ง cross ขึ้น
+cross_short = ema_short and not ema_short[1]  // เพิ่ง cross ลง
+
+// ── Entry signals (EMA cross + ATR pass) ──
+go_long  = cross_long  and atr_pass and in_date_range
+go_short = cross_short and atr_pass and in_date_range
+
+// ── Exit to flat (EMA cross + ATR fail) ──
+exit_flat_from_long  = cross_short and not atr_pass and strategy.position_size > 0
+exit_flat_from_short = cross_long  and not atr_pass and strategy.position_size < 0
+
+// ── ปิดเมื่อออกนอก date range ──
+exit_date = use_date and time > end_date and strategy.position_size != 0
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            STRATEGY EXECUTION                ║
+// ╚═════════════════════════════════════════════╝
+
+// LONG entry (ปิด SHORT ถ้ามี + เปิด LONG)
+if go_long
+    strategy.entry("LONG", strategy.long, comment="LONG")
+
+// SHORT entry (ปิด LONG ถ้ามี + เปิด SHORT)
+if go_short
+    strategy.entry("SHORT", strategy.short, comment="SHORT")
+
+// Exit to flat (ATR filter fail)
+if exit_flat_from_long
+    strategy.close("LONG", comment="ATR Flat")
+
+if exit_flat_from_short
+    strategy.close("SHORT", comment="ATR Flat")
+
+// Exit on date range end
+if exit_date
+    strategy.close_all(comment="Date End")
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            PLOTS                             ║
+// ╚═════════════════════════════════════════════╝
+
+// EMA line — สีเขียวเมื่อ bullish, แดงเมื่อ bearish
+plot(ema_val, "EMA", color=ema_long ? color.new(#00FF88, 0) : color.new(#FF6B6B, 0),
+     linewidth=2)
+
+// ATR zone background — พื้นหลังแดงจางเมื่อ ATR ต่ำ (no-trade zone)
+atr_fail_color = show_atr_bg and not atr_pass ? color.new(#FF4444, 88) : na
+bgcolor(atr_fail_color, title="ATR Low Zone")
+
+// Signal markers
+plotshape(go_long  and show_labels, "Long Signal",
+     shape.triangleup, location.belowbar,
+     color=color.new(#00FF88, 0), size=size.small, text="L")
+
+plotshape(go_short and show_labels, "Short Signal",
+     shape.triangledown, location.abovebar,
+     color=color.new(#FF6B6B, 0), size=size.small, text="S")
+
+plotshape((exit_flat_from_long or exit_flat_from_short) and show_labels, "Flat Exit",
+     shape.xcross, location.abovebar,
+     color=color.new(#FFA500, 0), size=size.tiny, text="F")
+
+
+// ╔═════════════════════════════════════════════╗
+// ║            INFO TABLE (มุมขวาบน)             ║
+// ╚═════════════════════════════════════════════╝
+
+var table info = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(#1a1a2e, 10),
+     border_color=color.new(#333355, 0),
+     border_width=1)
+
+if barstate.islast
+    table.cell(info, 0, 0, "EMA Period",     text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 0, str.tostring(ema_period),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 1, "ATR Filter",     text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 1, atr_enabled ? "ON" : "OFF",
+         text_color=atr_enabled ? #00FF88 : #FF4444, text_size=size.small)
+
+    table.cell(info, 0, 2, "ATR Period",     text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(atr_period),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 3, "ATR MA",         text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(atr_ma_period),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 4, "ATR Mult",       text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(atr_mult, "#.##"),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 5, "ATR Now",        text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(atr_val, "#.##"),
+         text_color=atr_pass ? #00FF88 : #FF4444, text_size=size.small)
+
+    table.cell(info, 0, 6, "ATR Threshold",  text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(atr_threshold, "#.##"),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 7, "Status",         text_color=color.gray, text_size=size.small)
+    status_text = strategy.position_size > 0 ? "LONG" :
+                  strategy.position_size < 0 ? "SHORT" : "FLAT"
+    status_color = strategy.position_size > 0 ? #00FF88 :
+                   strategy.position_size < 0 ? #FF6B6B : #FFA500
+    table.cell(info, 1, 7, status_text,
+         text_color=status_color, text_size=size.small)
