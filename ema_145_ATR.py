@@ -54,7 +54,7 @@ DESKTOP = os.path.expanduser("~/Desktop")
 
 SYMBOL          = "ETHUSDT"
 START_DATE      = "2024-01-01"
-END_DATE        = "2026-04-03"
+END_DATE        = "2024-03-04"
 INITIAL_CAPITAL = 2500
 
 # ── EMA ────────────────────────────────────────
@@ -80,7 +80,7 @@ ATR_MULTIPLIER  = 0.9                # ATR ปัจจุบัน > ATR_MA × 
 # ── Costs (Binance Futures) ───────────────────
 FEE_PER_SIDE    = 0.05
 FUNDING_RATE    = 0.01
-FUNDING_INTERVAL_HOURS = 4
+FUNDING_INTERVAL_HOURS = 8      # Binance USDT-M ETH/BTC funds every 8h (not 4h)
 INTEREST_RATE_DAILY = 0.00
 
 # ── Monte Carlo ───────────────────────────────
@@ -223,8 +223,11 @@ def calc_atr(df, period=14):
 def calc_holding_costs(direction, notional, holding_hours):
     n_funding = holding_hours / FUNDING_INTERVAL_HOURS
     funding_rate_decimal = FUNDING_RATE / 100
-    # funding เป็นต้นทุนเสมอ (เสีย 0.01%) ไม่ว่า LONG หรือ SHORT
-    funding_cost = notional * funding_rate_decimal * n_funding
+    # ใช้ historic average funding: LONG จ่าย, SHORT รับ
+    if direction == 'LONG':
+        funding_cost = notional * funding_rate_decimal * n_funding
+    else:
+        funding_cost = -notional * funding_rate_decimal * n_funding
     interest_rate_per_hour = (INTEREST_RATE_DAILY / 100) / 24
     interest_cost = notional * interest_rate_per_hour * holding_hours
     return funding_cost, interest_cost

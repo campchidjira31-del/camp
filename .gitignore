@@ -1,1 +1,13 @@
+# Output CSVs (generated each run)
+*.csv
+
+# Claude Code internal files
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
 .DS_Store

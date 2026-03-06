@@ -1,25 +1,23 @@
 """
 ================================================================
-Multi-TF Strategy — SuperTrend + RSI(4H) + ADX + Bollinger Bands
+MACD + EMA Trend Strategy — Futures Backtest
 ================================================================
-Higher TF (4H):
-  - SuperTrend uptrend  → LONG  |  SuperTrend downtrend → SHORT
-  - RSI(4H) > 70        → LONG  |  RSI(4H) < 30         → SHORT
-  - ADX(4H) > 40        → strong trend required
+Strategy:
+  Trend Filter : Price vs EMA(EMA_PERIOD) on 1H
+  Entry Signal : MACD line crosses signal line in trend direction
+                 LONG  — price > EMA  AND  MACD crosses UP   above signal
+                 SHORT — price < EMA  AND  MACD crosses DOWN  below signal
 
-Current TF (TIMEFRAME):
-  - ADX > 20            → local trend confirmation
-  - Entry LONG : price touches lower Bollinger Band → enter at lower BB
-  - Entry SHORT: price touches upper Bollinger Band → enter at upper BB
-  - SL   LONG : entry - 6 x ATR  (fixed)
-  - SL   SHORT: entry + 6 x ATR  (fixed)
-  - TP   LONG : upper Bollinger Band (dynamic each bar)
-  - TP   SHORT: lower Bollinger Band (dynamic each bar)
+  Stop Loss    : LONG  — below last swing low (SWING_LOOKBACK bars) − ATR×ATR_SL_MULT
+                 SHORT — above last swing high (SWING_LOOKBACK bars) + ATR×ATR_SL_MULT
 
-Risk: 2% x leverage of account per trade
+  Take Profit  : Fixed RR (entry ± RR_TARGET × risk distance)
 
-Data: Binance Public API
-Run:  python3 rsi_mean_revert.py
+  Signal detected at bar i close → entry fills at bar i+1 open.
+  One position at a time (no pyramiding).
+
+Data: Binance Futures API (fapi.binance.com)
+Run:  python3 MACD.py
 ================================================================
 """
 
@@ -49,58 +47,45 @@ DESKTOP = os.path.expanduser("~/Desktop")
 #  SETTINGS
 # ============================================================
 
-SYMBOL          = "ETHUSDT"
-TIMEFRAME       = "1h"        # Current / lower trading TF
-HTF             = "4h"        # Higher TF for RSI, SuperTrend, ADX
+SYMBOL          = "BTCUSDT"
+TIMEFRAME       = "1h"
 START_DATE      = "2023-01-01"
-END_DATE        = "2025-08-01"   # "" = today
+END_DATE        = "2025-01-01"
 INITIAL_CAPITAL = 2500
 
-# -- Higher TF (4H) indicators --------------------------------
-RSI_PERIOD_HTF      = 14
-RSI_LONG_TH         = 65      # 4H RSI > 70  -> LONG condition
-RSI_SHORT_TH        = 35      # 4H RSI < 30  -> SHORT condition
+# -- EMA (trend direction) ------------------------------------
+EMA_PERIOD      = 200        # price > EMA → bullish trend
 
-SUPERTREND_PERIOD   = 10
-SUPERTREND_MULT     = 2.0
+# -- MACD (entry signal) --------------------------------------
+MACD_FAST       = 12
+MACD_SLOW       = 26
+MACD_SIGNAL_P   = 9
 
-ADX_PERIOD_HTF      = 25
-ADX_TH_HTF          = 25      # 4H ADX must exceed this
+# -- Stop Loss ------------------------------------------------
+ATR_PERIOD      = 14
+ATR_SL_MULT     = 1.5        # SL = swing_low  − ATR_SL_MULT × ATR  (long)
+                              #      swing_high + ATR_SL_MULT × ATR  (short)
+SWING_LOOKBACK  = 20         # bars to look back for swing high/low
 
-# -- Current TF indicators ------------------------------------
-ADX_PERIOD          = 14
-ADX_TH              = 10      # Current TF ADX must exceed this
-
-RSI_PERIOD_LTF      = 14
-RSI_LTF_LONG_MAX    = 40     # LTF RSI must be below this to confirm long pullback
-RSI_LTF_SHORT_MIN   = 60     # LTF RSI must be above this to confirm short pullback
-
-TIME_STOP_BARS      = 600     # Close trade after N bars if no SL/TP hit
-
-BB_PERIOD           = 20
-BB_STD              = 2.0
-
-ATR_PERIOD          = 14
-ATR_SL_MULT         = 1.5    # SL = entry +/- ATR_SL_MULT * ATR
+# -- Take Profit ----------------------------------------------
+RR_TARGET       = 2.0        # TP = entry ± RR_TARGET × risk
 
 # -- Risk management ------------------------------------------
-RISK_PCT            = 0.02   # 2% of capital per trade (scaled by leverage)
+RISK_PCT        = 0.02       # 2% of capital per trade (scaled by leverage)
+LEVERAGES       = [1, 3, 5, 10]
 
-# -- Leverage grid --------------------------------------------
-LEVERAGES           = [1, 3, 4, 5, 10]
-
-# -- Costs (Binance Futures) ----------------------------------
-FEE_PER_SIDE            = 0.05   # % taker per side
-FUNDING_RATE            = 0.01   # % per interval
-FUNDING_INTERVAL_HOURS  = 8      # Binance USDT-M BTC/ETH fund every 8h (not 4h)
-INTEREST_RATE_DAILY     = 0.00   # Already included in funding rate on Binance USDT-M
+# -- Costs (Binance USDT-M Futures) ---------------------------
+FEE_PER_SIDE            = 0.05
+FUNDING_RATE            = 0.01
+FUNDING_INTERVAL_HOURS  = 8
+INTEREST_RATE_DAILY     = 0.00
 
 # -- Monte Carlo ----------------------------------------------
 MC_ENABLED  = True
 MC_RUNS     = 5000
 
 # -- Warmup ---------------------------------------------------
-WARMUP_DAYS = 60
+WARMUP_DAYS = 60    # needs MACD_SLOW + EMA_PERIOD bars to warm up
 
 # ============================================================
 
@@ -112,11 +97,11 @@ if END_DATE > today_str:
 
 
 # ============================================================
-#  Binance Data Download
+#  Binance Futures Data Download
 # ============================================================
 
 def binance_klines(symbol, interval, start_str, end_str, limit=1000):
-    url      = "https://api.binance.com/api/v3/klines"
+    url      = "https://fapi.binance.com/fapi/v1/klines"
     start_ms = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ms   = int(datetime.strptime(end_str,   "%Y-%m-%d").timestamp() * 1000)
     all_data = []
@@ -162,8 +147,7 @@ def safe_download(symbol, tf, start_str, end_str):
     print(f"\n  Downloading {symbol} {tf.upper()} ({start_str} -> {end_str})...")
     df = binance_klines(symbol, tf, start_str, end_str)
     if df.empty:
-        print(f"   No data returned")
-        return pd.DataFrame()
+        print("   No data returned"); return pd.DataFrame()
     print(f"   {len(df)} bars  ({df.index[0].date()} -> {df.index[-1].date()})")
     return df
 
@@ -175,111 +159,31 @@ def tz_strip(df):
 
 
 # ============================================================
-#  Indicator Functions
+#  Indicators
 # ============================================================
 
-def calc_rsi(prices, period=14):
-    d  = prices.diff()
-    ag = d.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
-    al = (-d.clip(upper=0)).ewm(com=period - 1, min_periods=period).mean()
-    return 100 - 100 / (1 + ag / al)
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calc_macd(close, fast=12, slow=26, signal=9):
+    ema_fast   = calc_ema(close, fast)
+    ema_slow   = calc_ema(close, slow)
+    macd_line  = ema_fast - ema_slow
+    signal_line = calc_ema(macd_line, signal)
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram
 
 
 def calc_atr(df, period=14):
     high  = df['High']
     low   = df['Low']
     close = df['Close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low  - close.shift(1)).abs()
-    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr1   = high - low
+    tr2   = (high - close.shift(1)).abs()
+    tr3   = (low  - close.shift(1)).abs()
+    tr    = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, min_periods=period).mean()
-
-
-def calc_supertrend(df, period=10, multiplier=3.0):
-    """
-    Returns (supertrend_line, trend_series).
-    trend: 1 = uptrend, -1 = downtrend.
-    """
-    atr  = calc_atr(df, period)
-    hl2  = (df['High'] + df['Low']) / 2
-
-    bu = (hl2 + multiplier * atr).values
-    bl = (hl2 - multiplier * atr).values
-    close = df['Close'].values
-    n = len(df)
-
-    fu = bu.copy()   # final upper band
-    fl = bl.copy()   # final lower band
-    st = np.full(n, np.nan)
-    tr = np.zeros(n, dtype=int)  # 0=uninit, 1=up, -1=down
-
-    for i in range(1, n):
-        if np.isnan(bu[i]) or np.isnan(bl[i]):
-            continue
-
-        # Carry-forward upper band
-        if np.isnan(fu[i - 1]):
-            fu[i] = bu[i]
-        else:
-            fu[i] = bu[i] if (bu[i] < fu[i - 1] or close[i - 1] > fu[i - 1]) else fu[i - 1]
-
-        # Carry-forward lower band
-        if np.isnan(fl[i - 1]):
-            fl[i] = bl[i]
-        else:
-            fl[i] = bl[i] if (bl[i] > fl[i - 1] or close[i - 1] < fl[i - 1]) else fl[i - 1]
-
-        if tr[i - 1] == 0:          # first valid bar -> start bearish
-            st[i] = fu[i]
-            tr[i] = -1
-        elif tr[i - 1] == -1:       # was bearish
-            if close[i] > fu[i]:
-                st[i] = fl[i]; tr[i] = 1
-            else:
-                st[i] = fu[i]; tr[i] = -1
-        else:                        # was bullish
-            if close[i] < fl[i]:
-                st[i] = fu[i]; tr[i] = -1
-            else:
-                st[i] = fl[i]; tr[i] = 1
-
-    return pd.Series(st, index=df.index), pd.Series(tr, index=df.index)
-
-
-def calc_adx(df, period=14):
-    high  = df['High']
-    low   = df['Low']
-    close = df['Close']
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low  - close.shift(1)).abs()
-    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    up   = high.diff()
-    down = -low.diff()
-    plus_dm  = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-
-    alpha    = 1 / period
-    atr_s    = tr.ewm(alpha=alpha, min_periods=period).mean()
-    plus_di  = 100 * plus_dm.ewm(alpha=alpha,  min_periods=period).mean() / atr_s
-    minus_di = 100 * minus_dm.ewm(alpha=alpha, min_periods=period).mean() / atr_s
-
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx    = 100 * (plus_di - minus_di).abs() / denom
-    adx   = dx.ewm(alpha=alpha, min_periods=period).mean()
-    return adx
-
-
-def calc_bollinger(df, period=20, n_std=2.0):
-    close = df['Close']
-    mid   = close.rolling(period).mean()
-    std   = close.rolling(period).std(ddof=1)
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return upper, mid, lower
 
 
 # ============================================================
@@ -287,8 +191,8 @@ def calc_bollinger(df, period=20, n_std=2.0):
 # ============================================================
 
 def calc_holding_costs(direction, notional, holding_hours):
-    n_funding        = holding_hours / FUNDING_INTERVAL_HOURS
-    funding_decimal  = FUNDING_RATE / 100
+    n_funding       = holding_hours / FUNDING_INTERVAL_HOURS
+    funding_decimal = FUNDING_RATE / 100
     if direction == 'LONG':
         funding_cost = notional * funding_decimal * n_funding
     else:
@@ -306,15 +210,13 @@ def run_backtest():
     funding_per_day = 24 / FUNDING_INTERVAL_HOURS * FUNDING_RATE
 
     print("=" * 72)
-    print(f"  {SYMBOL}  |  SuperTrend + RSI({HTF.upper()}) + ADX + Bollinger Bands  |  {TIMEFRAME.upper()}")
+    print(f"  {SYMBOL}  |  MACD + EMA Strategy  |  {TIMEFRAME.upper()}")
     print(f"  Period   : {START_DATE} -> {END_DATE}  |  Capital: ${INITIAL_CAPITAL:,.0f}")
-    print(f"  HTF ({HTF.upper()}) : SuperTrend({SUPERTREND_PERIOD},{SUPERTREND_MULT})  "
-          f"RSI>{RSI_LONG_TH} LONG / <{RSI_SHORT_TH} SHORT  ADX>{ADX_TH_HTF}")
-    print(f"  LTF ({TIMEFRAME.upper()}) : ADX>{ADX_TH}  |  BB({BB_PERIOD},{BB_STD})  |  "
-          f"SL = entry +/- {ATR_SL_MULT}x ATR({ATR_PERIOD})")
-    print(f"  Entry    : LONG @ Lower BB  /  SHORT @ Upper BB")
-    print(f"  TP       : LONG @ Upper BB  /  SHORT @ Lower BB  (dynamic)")
-    print(f"  Risk     : {RISK_PCT*100:.0f}% x leverage per trade")
+    print(f"  Trend    : EMA({EMA_PERIOD})  —  price > EMA = LONG bias, < EMA = SHORT bias")
+    print(f"  Signal   : MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P}) cross signal line")
+    print(f"  SL       : Swing HL({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR({ATR_PERIOD})")
+    print(f"  TP       : Fixed {RR_TARGET}:1 RR")
+    print(f"  Risk     : {RISK_PCT*100:.0f}% × leverage per trade")
     print(f"  Leverage : {' / '.join(f'{l}x' for l in LEVERAGES)}")
     print(f"  Fee      : {FEE_PER_SIDE}%/side  |  Funding: {FUNDING_RATE}%/{FUNDING_INTERVAL_HOURS}h "
           f"({funding_per_day:.3f}%/day)")
@@ -323,59 +225,34 @@ def run_backtest():
     start_dt     = datetime.strptime(START_DATE, "%Y-%m-%d")
     warmup_start = (start_dt - timedelta(days=WARMUP_DAYS)).strftime("%Y-%m-%d")
 
-    # ---- Download both timeframes ----
-    df_ltf = safe_download(SYMBOL, TIMEFRAME, warmup_start, END_DATE)
-    df_htf = safe_download(SYMBOL, HTF,       warmup_start, END_DATE)
-
-    if df_ltf.empty or df_htf.empty:
+    df = safe_download(SYMBOL, TIMEFRAME, warmup_start, END_DATE)
+    if df.empty:
         print("Download failed"); return
+    df = tz_strip(df)
 
-    df_ltf = tz_strip(df_ltf)
-    df_htf = tz_strip(df_htf)
+    # ---- Indicators ----
+    df['EMA']        = calc_ema(df['Close'], EMA_PERIOD)
+    macd, sig, hist  = calc_macd(df['Close'], MACD_FAST, MACD_SLOW, MACD_SIGNAL_P)
+    df['MACD']       = macd
+    df['Signal']     = sig
+    df['Hist']       = hist
+    df['ATR']        = calc_atr(df, ATR_PERIOD)
 
-    # ---- HTF indicators ----
-    df_htf['RSI'] = calc_rsi(df_htf['Close'], RSI_PERIOD_HTF)
-    df_htf['ADX'] = calc_adx(df_htf, ADX_PERIOD_HTF)
-    st_vals, st_trend    = calc_supertrend(df_htf, SUPERTREND_PERIOD, SUPERTREND_MULT)
-    df_htf['ST_val']   = st_vals
-    df_htf['ST_trend'] = st_trend   # 1=uptrend, -1=downtrend
+    # Rolling swing high / low (look back only, include current bar)
+    df['swing_low']  = df['Low'].rolling(SWING_LOOKBACK).min()
+    df['swing_high'] = df['High'].rolling(SWING_LOOKBACK).max()
 
-    # ---- Current TF indicators ----
-    df_ltf['ATR']     = calc_atr(df_ltf, ATR_PERIOD)
-    df_ltf['ADX']     = calc_adx(df_ltf, ADX_PERIOD)
-    df_ltf['RSI_ltf'] = calc_rsi(df_ltf['Close'], RSI_PERIOD_LTF)
-    bb_up, bb_mid, bb_lo = calc_bollinger(df_ltf, BB_PERIOD, BB_STD)
-    df_ltf['BB_upper'] = bb_up
-    df_ltf['BB_mid']   = bb_mid
-    df_ltf['BB_lower'] = bb_lo
-
-    # ---- Merge HTF indicators into LTF via forward-fill ----
-    # IMPORTANT: shift(1) on the HTF frame before reindexing.
-    # A 4H bar at open_time T uses OHLC data up to T+4h (its close).
-    # Without shift, the 1H bars at T, T+1h, T+2h, T+3h would receive
-    # an indicator that includes their own future data (look-ahead).
-    # shift(1) ensures only the PREVIOUS completed 4H bar's value is used.
-    df_ltf['HTF_RSI']      = df_htf['RSI'].shift(1).reindex(df_ltf.index, method='ffill')
-    df_ltf['HTF_ADX']      = df_htf['ADX'].shift(1).reindex(df_ltf.index, method='ffill')
-    df_ltf['HTF_ST_trend'] = df_htf['ST_trend'].shift(1).reindex(df_ltf.index, method='ffill')
-
-    # ---- Shift current-TF signals by 1 bar to fix look-ahead bias ----
-    # All current-TF indicators are computed from bar i's CLOSE.
-    # In live trading you only know bar i's close AFTER it closes, so
-    # entry/exit decisions must use values from the previous bar (shift 1).
-    df_ltf['BB_upper_s']  = df_ltf['BB_upper'].shift(1)
-    df_ltf['BB_lower_s']  = df_ltf['BB_lower'].shift(1)
-    df_ltf['ADX_s']       = df_ltf['ADX'].shift(1)
-    df_ltf['ATR_s']       = df_ltf['ATR'].shift(1)
-    df_ltf['RSI_ltf_s']   = df_ltf['RSI_ltf'].shift(1)
+    # MACD crossover flags (bar i)
+    df['cross_up'] = (df['MACD'] >  df['Signal']) & (df['MACD'].shift(1) <= df['Signal'].shift(1))
+    df['cross_dn'] = (df['MACD'] <  df['Signal']) & (df['MACD'].shift(1) >= df['Signal'].shift(1))
 
     # ---- Clip to backtest window ----
-    bt_start  = max(pd.Timestamp(START_DATE), df_ltf.index[0])
-    df_bt     = df_ltf[df_ltf.index >= bt_start].copy()
+    bt_start  = max(pd.Timestamp(START_DATE), df.index[0])
+    df_bt     = df[df.index >= bt_start].copy()
     if df_bt.empty:
         print("No data in backtest window"); return
 
-    start_idx = df_ltf.index.searchsorted(bt_start)
+    start_idx = df.index.searchsorted(bt_start)
 
     # ---- Buy & Hold benchmark ----
     bnh_start = float(df_bt['Close'].iloc[0])
@@ -384,68 +261,52 @@ def run_backtest():
     bnh_ret   = (bnh_final - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
 
     # ============================================================
-    #  Signal Detection
+    #  Signal Detection Loop
     # ============================================================
     signals    = []
     position   = None
     entry_info = None
 
-    required_cols = ['ATR_s', 'ADX_s', 'BB_upper_s', 'BB_lower_s',
-                     'HTF_RSI', 'HTF_ADX', 'HTF_ST_trend', 'RSI_ltf_s']
+    required_cols = ['EMA', 'MACD', 'Signal', 'ATR', 'swing_low', 'swing_high',
+                     'cross_up', 'cross_dn']
 
-    for i in range(start_idx, len(df_ltf)):
-        row = df_ltf.iloc[i]
+    # Loop to start_idx+1 so we can always read i+1 for entry fill
+    for i in range(start_idx, len(df) - 1):
+        row      = df.iloc[i]
+        next_bar = df.iloc[i + 1]      # entry fills at next bar's open
+        t        = df.index[i]
 
         if any(pd.isna(row[c]) for c in required_cols):
             continue
 
-        high     = row['High']
-        low      = row['Low']
-        t        = df_ltf.index[i]
-        atr      = row['ATR_s']       # previous bar's ATR for SL sizing
-        bb_upper = row['BB_upper_s']  # previous bar's upper BB
-        bb_lower = row['BB_lower_s']  # previous bar's lower BB
-        adx      = row['ADX_s']       # previous bar's ADX
+        close      = float(row['Close'])
+        ema        = float(row['EMA'])
+        atr        = float(row['ATR'])
+        swing_lo   = float(row['swing_low'])
+        swing_hi   = float(row['swing_high'])
+        cross_up   = bool(row['cross_up'])
+        cross_dn   = bool(row['cross_dn'])
 
-        htf_trend = int(row['HTF_ST_trend'])
-        htf_rsi   = row['HTF_RSI']
-        htf_adx   = row['HTF_ADX']
-        rsi_ltf   = row['RSI_ltf_s']
-
-        # ---- 1. Check open position: SL / TP / SuperTrend flip / time stop ----
+        # ---- 1. Manage open position ----
         if position is not None and entry_info is not None:
-            sl         = entry_info['sl']
+            sl = entry_info['sl']
+            tp = entry_info['tp']
+
+            h = float(row['High'])
+            l = float(row['Low'])
             exit_price = None
             outcome    = None
 
-            bars_held = i - entry_info['entry_bar']
-
-            # SuperTrend flip: HTF trend reversed against our position
-            st_flip = (position == 'LONG'  and htf_trend == -1) or \
-                      (position == 'SHORT' and htf_trend ==  1)
-            # Time stop
-            time_stop = bars_held >= TIME_STOP_BARS
-
             if position == 'LONG':
-                tp = bb_upper          # upper BB is TP, updated each bar
-                if low <= sl:
+                if l <= sl:
                     exit_price, outcome = sl, 'SL'
-                elif high >= tp:
+                elif h >= tp:
                     exit_price, outcome = tp, 'TP'
-                elif st_flip:
-                    exit_price, outcome = float(row['Open']), 'ST_FLIP'
-                elif time_stop:
-                    exit_price, outcome = float(row['Open']), 'TIME'
-            else:                       # SHORT
-                tp = bb_lower          # lower BB is TP, updated each bar
-                if high >= sl:
+            else:
+                if h >= sl:
                     exit_price, outcome = sl, 'SL'
-                elif low <= tp:
+                elif l <= tp:
                     exit_price, outcome = tp, 'TP'
-                elif st_flip:
-                    exit_price, outcome = float(row['Open']), 'ST_FLIP'
-                elif time_stop:
-                    exit_price, outcome = float(row['Open']), 'TIME'
 
             if exit_price is not None:
                 signals.append({
@@ -456,57 +317,59 @@ def run_backtest():
                 })
                 position   = None
                 entry_info = None
-                continue
+                # fall through — can open new trade same bar if signal fires
 
-        # ---- 2. Look for new entry ----
+        # ---- 2. Look for new entry (only one position at a time) ----
         if position is None:
-            bull_htf = (htf_trend == 1  and htf_rsi > RSI_LONG_TH  and htf_adx > ADX_TH_HTF)
-            bear_htf = (htf_trend == -1 and htf_rsi < RSI_SHORT_TH and htf_adx > ADX_TH_HTF)
-            adx_ok   = adx > ADX_TH
-
             direction   = None
-            entry_price = None
+            entry_price = float(next_bar['Open'])  # fill at next bar open
+            sl          = None
+            tp          = None
 
-            # LTF RSI must confirm pullback (oversold for LONG, overbought for SHORT)
-            if bull_htf and adx_ok and rsi_ltf < RSI_LTF_LONG_MAX and low <= bb_lower:
-                direction   = 'LONG'
-                # Limit buy at lower BB; if open gaps below, fill at open
-                entry_price = min(float(bb_lower), float(row['Open']))
+            # LONG: price > EMA + MACD crosses up
+            if close > ema and cross_up:
+                sl = swing_lo - ATR_SL_MULT * atr
+                if entry_price > sl:
+                    risk = entry_price - sl
+                    tp   = entry_price + RR_TARGET * risk
+                    direction = 'LONG'
 
-            elif bear_htf and adx_ok and rsi_ltf > RSI_LTF_SHORT_MIN and high >= bb_upper:
-                direction   = 'SHORT'
-                # Limit sell at upper BB; if open gaps above, fill at open
-                entry_price = max(float(bb_upper), float(row['Open']))
+            # SHORT: price < EMA + MACD crosses down
+            elif close < ema and cross_dn:
+                sl = swing_hi + ATR_SL_MULT * atr
+                if entry_price < sl:
+                    risk = sl - entry_price
+                    tp   = entry_price - RR_TARGET * risk
+                    direction = 'SHORT'
 
             if direction is not None:
-                if direction == 'LONG':
-                    sl = entry_price - ATR_SL_MULT * atr
-                else:
-                    sl = entry_price + ATR_SL_MULT * atr
-
                 entry_info = {
                     'direction':   direction,
                     'entry_price': entry_price,
-                    'entry_time':  t,
-                    'entry_bar':   i,
-                    'atr':         float(atr),
+                    'entry_time':  df.index[i + 1],
+                    'signal_time': t,
                     'sl':          float(sl),
+                    'tp':          float(tp),
+                    'atr':         float(atr),
+                    'swing_lo':    float(swing_lo),
+                    'swing_hi':    float(swing_hi),
+                    'ema_at_entry': float(ema),
                 }
                 position = direction
 
-    # Close any trade still open at last bar
+    # Close any open trade at last bar
     if position is not None and entry_info is not None:
-        last = df_ltf.iloc[-1]
+        last = df.iloc[-1]
         signals.append({
             **entry_info,
             'exit_price': float(last['Close']),
-            'exit_time':  df_ltf.index[-1],
+            'exit_time':  df.index[-1],
             'outcome':    'OPEN',
         })
 
     print(f"\n  Trades found: {len(signals)}")
     if len(signals) < 2:
-        print("  Too few trades. Try adjusting thresholds or expanding the date range.")
+        print("  Too few trades. Try expanding the date range or loosening parameters.")
         return
 
     total_bt_hours  = (pd.Timestamp(END_DATE) - pd.Timestamp(START_DATE)).total_seconds() / 3600
@@ -534,14 +397,14 @@ def run_backtest():
             entry_time  = sig['entry_time']
             exit_time   = sig['exit_time']
             outcome     = sig['outcome']
-            atr_entry   = sig['atr']
+            sl          = sig['sl']
 
-            # Position sizing: risk = RISK_PCT * lev * capital
-            risk_amount   = capital * RISK_PCT * lev
-            risk_per_unit = ATR_SL_MULT * atr_entry
+            risk_per_unit = abs(entry_price - sl)
             if risk_per_unit <= 0 or capital <= 0:
                 continue
-            qty = risk_amount / risk_per_unit
+
+            risk_amount = capital * RISK_PCT * lev
+            qty         = risk_amount / risk_per_unit
 
             holding_hours = max(
                 (exit_time - entry_time).total_seconds() / 3600, 0
@@ -573,15 +436,20 @@ def run_backtest():
             eq_curve.append({'time': exit_time, 'equity': capital, 'pnl': pnl_net})
             trades.append({
                 'trade_no':     len(trades) + 1,
+                'signal_time':  sig.get('signal_time', entry_time),
                 'entry_time':   entry_time,
                 'exit_time':    exit_time,
                 'direction':    direction,
-                'entry_price':  round(entry_price, 4),
-                'exit_price':   round(exit_price,  4),
-                'sl':           round(sig['sl'],    4),
+                'entry_price':  round(entry_price, 2),
+                'exit_price':   round(exit_price,  2),
+                'sl':           round(sl,           2),
+                'tp':           round(sig['tp'],    2),
                 'outcome':      outcome,
                 'holding_hours':round(holding_hours, 1),
-                'qty':          round(qty, 4),
+                'qty':          round(qty, 6),
+                'atr':          round(sig['atr'],   2),
+                'swing_lo':     round(sig['swing_lo'], 2),
+                'swing_hi':     round(sig['swing_hi'], 2),
                 'pnl_raw':      round(pnl_raw,      2),
                 'commission':   round(commission,   2),
                 'funding_fee':  round(funding_cost, 2),
@@ -634,11 +502,11 @@ def run_backtest():
                    if len(down) > 1 and down.std() > 0 else 0)
         calmar  = cagr / abs(max_dd) if max_dd != 0 else 0
 
-        comm_total     = df_t['commission'].sum()
-        funding_total  = df_t['funding_fee'].sum()
-        interest_total = df_t['interest_fee'].sum()
-        all_cost_total = df_t['total_cost'].sum()
-        avg_hold       = df_t['holding_hours'].mean()
+        comm_total    = df_t['commission'].sum()
+        funding_total = df_t['funding_fee'].sum()
+        int_total     = df_t['interest_fee'].sum()
+        cost_total    = df_t['total_cost'].sum()
+        avg_hold      = df_t['holding_hours'].mean()
 
         lev_results[lev] = {
             'df_t': df_t, 'df_e': df_e,
@@ -648,12 +516,12 @@ def run_backtest():
             'eq_arr': eq_arr, 'dd_arr': dd_arr,
             'sharpe': sharpe, 'sortino': sortino, 'calmar': calmar, 'cagr': cagr,
             'comm_total': comm_total, 'funding_total': funding_total,
-            'interest_total': interest_total, 'all_cost_total': all_cost_total,
+            'int_total': int_total, 'cost_total': cost_total,
             'avg_hold': avg_hold, 'in_market_pct': in_market_pct,
         }
 
     # ============================================================
-    #  Print Results Table
+    #  Print Results
     # ============================================================
     levs = list(lev_results.keys())
     if not levs:
@@ -663,9 +531,9 @@ def run_backtest():
     total_w = 26 + col_w * len(levs) + col_w
 
     print(f"\n{'='*total_w}")
-    print(f"  {SYMBOL}  |  SuperTrend+RSI({HTF.upper()})+ADX+BB  |  {TIMEFRAME.upper()}")
-    print(f"  HTF: ST({SUPERTREND_PERIOD},{SUPERTREND_MULT})  RSI>{RSI_LONG_TH}/<{RSI_SHORT_TH}  ADX>{ADX_TH_HTF}")
-    print(f"  LTF: ADX>{ADX_TH}  BB({BB_PERIOD})  SL=entry+/-{ATR_SL_MULT}xATR  Risk={RISK_PCT*100:.0f}%xlev")
+    print(f"  {SYMBOL}  |  MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P}) + EMA({EMA_PERIOD})  |  {TIMEFRAME.upper()}")
+    print(f"  Trend: price vs EMA({EMA_PERIOD})  |  Signal: MACD cross")
+    print(f"  SL: Swing({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR  |  TP: {RR_TARGET}:1 RR  |  Risk: {RISK_PCT*100:.0f}%×lev")
     print(f"  Time in market: {in_market_pct:.1f}%")
     print(f"{'='*total_w}")
 
@@ -705,23 +573,23 @@ def run_backtest():
     row("Avg Hold (hrs)",    [lev_results[l]['avg_hold']for l in levs], "{:>9.0f}")
     print(f"  {'-'*(total_w-2)}")
     print(f"  COST BREAKDOWN")
-    row("  Commission",      [lev_results[l]['comm_total']     for l in levs], "${:>9,.0f}")
-    row("  Funding Fee",     [lev_results[l]['funding_total']  for l in levs], "${:>9,.0f}")
-    row("  Interest",        [lev_results[l]['interest_total'] for l in levs], "${:>9,.0f}")
-    row("  TOTAL COST",      [lev_results[l]['all_cost_total'] for l in levs], "${:>9,.0f}")
+    row("  Commission",      [lev_results[l]['comm_total']    for l in levs], "${:>9,.0f}")
+    row("  Funding Fee",     [lev_results[l]['funding_total'] for l in levs], "${:>9,.0f}")
+    row("  Interest",        [lev_results[l]['int_total']     for l in levs], "${:>9,.0f}")
+    row("  TOTAL COST",      [lev_results[l]['cost_total']    for l in levs], "${:>9,.0f}")
     print(f"{'='*total_w}")
 
     print(f"\n  Cost as % of capital:")
     for l in levs:
         r  = lev_results[l]
-        pc = r['comm_total']     / INITIAL_CAPITAL * 100
-        pf = r['funding_total']  / INITIAL_CAPITAL * 100
-        pi = r['interest_total'] / INITIAL_CAPITAL * 100
-        pa = r['all_cost_total'] / INITIAL_CAPITAL * 100
-        print(f"     {l:>2}x: Comm {pc:>6.1f}%  Fund {pf:>+7.1f}%  Int {pi:>6.1f}%  -> Total {pa:>7.1f}%")
+        pc = r['comm_total']    / INITIAL_CAPITAL * 100
+        pf = r['funding_total'] / INITIAL_CAPITAL * 100
+        pa = r['cost_total']    / INITIAL_CAPITAL * 100
+        print(f"     {l:>2}x: Comm {pc:>6.1f}%  Fund {pf:>+7.1f}%  -> Total {pa:>7.1f}%")
 
     base_lev = levs[0]
     df_base  = lev_results[base_lev]['df_t']
+
     print(f"\n  Direction breakdown ({base_lev}x):")
     for d in ['LONG', 'SHORT']:
         sub = df_base[df_base['direction'] == d]
@@ -730,13 +598,18 @@ def run_backtest():
             wr2 = w / len(sub) * 100
             p   = sub['pnl_net'].sum()
             ah  = sub['holding_hours'].mean()
-            fd  = sub['funding_fee'].sum()
             print(f"     {d:<7}: {len(sub):>3} trades | WR: {wr2:.1f}% | "
-                  f"PnL: ${p:,.0f} | Avg Hold: {ah:.0f}h | Fund: ${fd:,.0f}")
+                  f"PnL: ${p:,.0f} | Avg Hold: {ah:.0f}h")
+
+    print(f"\n  Outcome breakdown ({base_lev}x):")
+    for o in ['TP', 'SL', 'OPEN']:
+        sub = df_base[df_base['outcome'] == o]
+        if not sub.empty:
+            print(f"     {o:<8}: {len(sub):>3} trades")
 
     # Save CSV
     best_lev = max(levs, key=lambda l: lev_results[l]['calmar'])
-    csv_path = os.path.join(DESKTOP, "rsi_mean_revert_trades.csv")
+    csv_path = os.path.join(DESKTOP, "macd_trades.csv")
     try:
         lev_results[best_lev]['df_t'].to_csv(csv_path, index=False)
         print(f"\n  CSV ({best_lev}x, best Calmar): {csv_path}")
@@ -753,8 +626,8 @@ def run_backtest():
         return
 
     try:
-        colors_lev = ['#00BFFF', '#00FF88', '#FFD700', '#FF6BFF', '#FF4444',
-                      '#7B68EE', '#FF8C00', '#00CED1']
+        colors_lev = ['#00BFFF', '#00FF88', '#FFD700', '#FF6BFF',
+                      '#FF4444', '#7B68EE', '#FF8C00', '#00CED1']
 
         fig, axes = plt.subplots(4, 1, figsize=(18, 22),
                                  gridspec_kw={'height_ratios': [3, 1.2, 1.8, 1.5]})
@@ -768,16 +641,15 @@ def run_backtest():
                 spine.set_edgecolor('#333355')
 
         fig.suptitle(
-            f'{SYMBOL}  SuperTrend + RSI({RSI_PERIOD_HTF},{HTF.upper()}) + ADX + Bollinger Bands  |  {TIMEFRAME.upper()}\n'
+            f'{SYMBOL}  MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P}) + EMA({EMA_PERIOD})  |  {TIMEFRAME.upper()}\n'
             f'{START_DATE} -> {END_DATE}  |  '
-            f'ST({SUPERTREND_PERIOD},{SUPERTREND_MULT})  RSI>{RSI_LONG_TH}/<{RSI_SHORT_TH}  '
-            f'ADX4H>{ADX_TH_HTF}  ADX>{ADX_TH}\n'
-            f'Entry: Lower/Upper BB  |  SL: +/-{ATR_SL_MULT}xATR  |  '
-            f'Risk: {RISK_PCT*100:.0f}%xlev  |  Time in market: {in_market_pct:.1f}%',
+            f'SL: Swing({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR  |  '
+            f'TP: {RR_TARGET}:1  |  Risk: {RISK_PCT*100:.0f}%×lev\n'
+            f'Time in market: {in_market_pct:.1f}%',
             fontsize=12, fontweight='bold', color='white'
         )
 
-        df_bt_plot = df_ltf[df_ltf.index >= bt_start]
+        df_bt_plot = df[df.index >= bt_start]
         t0 = df_bt_plot.index[0]
 
         # Panel 1: Equity curves
@@ -816,50 +688,49 @@ def run_backtest():
                    loc='lower left', ncol=2)
         ax2.grid(True, alpha=0.15, color='white')
 
-        # Panel 3: Risk grid bar chart
+        # Panel 3: Risk grid
         ax3 = axes[2]
         x_pos = np.arange(len(levs))
         bar_w = 0.12
-        cagrs     = [lev_results[l]['cagr'] for l in levs]
+        cagrs     = [lev_results[l]['cagr']    for l in levs]
         max_dds   = [abs(lev_results[l]['max_dd']) for l in levs]
         sharpes   = [lev_results[l]['sharpe'] * 10 for l in levs]
         calmars   = [lev_results[l]['calmar'] * 10 for l in levs]
-        costs_pct = [lev_results[l]['all_cost_total'] / INITIAL_CAPITAL * 100 for l in levs]
+        costs_pct = [lev_results[l]['cost_total'] / INITIAL_CAPITAL * 100 for l in levs]
 
-        ax3.bar(x_pos - 2*bar_w, cagrs,                 bar_w, label='CAGR %',      color='#00FF88', alpha=0.85)
-        ax3.bar(x_pos -   bar_w, [-d for d in max_dds], bar_w, label='Max DD %',    color='#FF4444', alpha=0.7)
-        ax3.bar(x_pos,           sharpes,                bar_w, label='Sharpe x10',  color='#00BFFF', alpha=0.7)
-        ax3.bar(x_pos +   bar_w, calmars,                bar_w, label='Calmar x10',  color='#FFD700', alpha=0.7)
-        ax3.bar(x_pos + 2*bar_w, [-c for c in costs_pct],bar_w, label='Total Cost %',color='#FF8888', alpha=0.5)
+        ax3.bar(x_pos - 2*bar_w, cagrs,                   bar_w, label='CAGR %',       color='#00FF88', alpha=0.85)
+        ax3.bar(x_pos -   bar_w, [-d for d in max_dds],   bar_w, label='Max DD %',     color='#FF4444', alpha=0.7)
+        ax3.bar(x_pos,           sharpes,                  bar_w, label='Sharpe x10',   color='#00BFFF', alpha=0.7)
+        ax3.bar(x_pos +   bar_w, calmars,                  bar_w, label='Calmar x10',   color='#FFD700', alpha=0.7)
+        ax3.bar(x_pos + 2*bar_w, [-c for c in costs_pct], bar_w, label='Total Cost %', color='#FF8888', alpha=0.5)
         ax3.set_xticks(x_pos)
         ax3.set_xticklabels([f'{l}x' for l in levs], color='white')
         ax3.axhline(0, color='white', lw=0.5)
         ax3.set_ylabel('Value', fontsize=11)
-        ax3.set_xlabel('Leverage', fontsize=11)
         ax3.set_title('Risk Grid + Cost Impact', fontsize=11, color='white')
         ax3.legend(fontsize=7.5, facecolor='#1a1a2e', labelcolor='white', ncol=5)
         ax3.grid(True, alpha=0.15, color='white')
 
-        # Panel 4: Trade P/L (best leverage)
+        # Panel 4: Trade PnL (best leverage)
         ax4 = axes[3]
         df_best    = lev_results[best_lev]['df_t']
         trade_pnls = df_best['pnl_net'].values
-        total_best = len(trade_pnls)
         colors_bar = ['#00FF88' if p > 0 else '#FF4444' for p in trade_pnls]
-        ax4.bar(range(1, total_best + 1), trade_pnls, color=colors_bar, alpha=0.8, width=0.8)
+        ax4.bar(range(1, len(trade_pnls) + 1), trade_pnls,
+                color=colors_bar, alpha=0.8, width=0.8)
         ax4.axhline(0, color='white', lw=0.5)
         ax4.set_ylabel(f'PnL per Trade $ ({best_lev}x)', fontsize=11)
         ax4.set_xlabel('Trade #', fontsize=10)
         wins_best   = len(df_best[df_best['result'] == 'WIN'])
         losses_best = len(df_best[df_best['result'] == 'LOSS'])
         ax4.set_title(
-            f'Best Calmar: {best_lev}x  |  Trades: {total_best}  |  '
-            f'Wins: {wins_best}  Losses: {losses_best}',
+            f'Best Calmar: {best_lev}x  |  Trades: {len(trade_pnls)}  |  '
+            f'Wins: {wins_best}  Losses: {losses_best}  |  WR: {wins_best/len(trade_pnls)*100:.1f}%',
             fontsize=10, color='#00BFFF')
         ax4.grid(True, alpha=0.15, color='white')
 
         plt.tight_layout()
-        chart_path = os.path.join(DESKTOP, "rsi_mean_revert_chart.png")
+        chart_path = os.path.join(DESKTOP, "macd_chart.png")
         plt.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='#0f0f0f')
         print(f"\n  Chart saved: {chart_path}")
         plt.show()
@@ -873,13 +744,13 @@ def run_backtest():
         print(f"\n  Monte Carlo using {best_lev}x (best Calmar)")
         run_monte_carlo(lev_results[best_lev]['df_t'], best_lev)
 
-    print(f"\nTips:")
-    print(f"   TIMEFRAME        = '{TIMEFRAME}'  (try '15m', '1h')")
-    print(f"   SUPERTREND_MULT  = {SUPERTREND_MULT}  (try 2.0, 3.0, 4.0)")
-    print(f"   RSI thresholds   = {RSI_LONG_TH} / {RSI_SHORT_TH}")
-    print(f"   ADX_TH_HTF       = {ADX_TH_HTF}   ADX_TH = {ADX_TH}")
-    print(f"   ATR_SL_MULT      = {ATR_SL_MULT}")
-    print(f"   BB_PERIOD        = {BB_PERIOD}  BB_STD = {BB_STD}")
+    print(f"\nTips for tuning:")
+    print(f"   EMA_PERIOD     = {EMA_PERIOD}   (try 50, 100, 200)")
+    print(f"   MACD params    = ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P})  (try 12,26,9 or 8,21,5)")
+    print(f"   SWING_LOOKBACK = {SWING_LOOKBACK}    (try 10, 20, 30)")
+    print(f"   ATR_SL_MULT    = {ATR_SL_MULT}   (try 1.0, 1.5, 2.0)")
+    print(f"   RR_TARGET      = {RR_TARGET}   (try 1.5, 2.0, 3.0)")
+    print(f"   SYMBOL         = '{SYMBOL}'  (try 'ETHUSDT')")
 
 
 # ============================================================
@@ -945,98 +816,6 @@ def run_monte_carlo(df_t, leverage):
     print(f"  {'Std Dev Return':<30} {np.std(final_returns):>6.1f}%")
     print(f"  {'Average Max DD':<30} {np.mean(max_drawdowns):>6.1f}%")
     print(f"{'='*65}")
-
-    if not HAS_PLOT:
-        return
-
-    try:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        fig.patch.set_facecolor('#0f0f0f')
-        for ax in axes.flat:
-            ax.set_facecolor('#1a1a2e')
-            ax.tick_params(colors='#cccccc')
-            ax.yaxis.label.set_color('#cccccc')
-            ax.xaxis.label.set_color('#cccccc')
-            ax.title.set_color('white')
-            for spine in ax.spines.values():
-                spine.set_edgecolor('#333355')
-
-        fig.suptitle(
-            f'Monte Carlo  |  {MC_RUNS:,} runs  |  {SYMBOL} {TIMEFRAME.upper()}  |  {leverage}x\n'
-            f'ST({SUPERTREND_PERIOD},{SUPERTREND_MULT})  RSI({RSI_PERIOD_HTF},{HTF.upper()}) '
-            f'>{RSI_LONG_TH}/<{RSI_SHORT_TH}  ADX4H>{ADX_TH_HTF}\n'
-            f'Prob Profit: {prob_profit:.1f}%  |  Blow-up: {prob_blow:.1f}%  |  '
-            f'Median: {ret_p[2]:+.1f}%',
-            fontsize=11, fontweight='bold', color='white')
-
-        # Equity paths
-        ax1 = axes[0, 0]
-        x   = np.arange(n_trades + 1)
-        sample_idx = np.random.choice(MC_RUNS, min(200, MC_RUNS), replace=False)
-        for idx in sample_idx:
-            eq_line = all_equity[idx] * INITIAL_CAPITAL
-            color   = '#00FF88' if eq_line[-1] > INITIAL_CAPITAL else '#FF4444'
-            ax1.plot(x, eq_line, color=color, alpha=0.04, lw=0.5)
-        eq_50 = np.percentile(all_equity, 50, axis=0) * INITIAL_CAPITAL
-        eq_5  = np.percentile(all_equity, 5,  axis=0) * INITIAL_CAPITAL
-        eq_95 = np.percentile(all_equity, 95, axis=0) * INITIAL_CAPITAL
-        ax1.fill_between(x, eq_5, eq_95, alpha=0.15, color='#00BFFF')
-        ax1.plot(x, eq_50, color='#00BFFF', lw=2, label='Median')
-        ax1.plot(x, eq_5,  color='#FF4444', lw=1, ls='--', label='5th')
-        ax1.plot(x, eq_95, color='#00FF88', lw=1, ls='--', label='95th')
-        ax1.axhline(INITIAL_CAPITAL, color='gray', ls=':', alpha=0.5)
-        ax1.set_title('Equity Paths', fontsize=11)
-        ax1.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white')
-        ax1.grid(True, alpha=0.15, color='white')
-        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'${v:,.0f}'))
-
-        # Final returns histogram
-        ax2 = axes[0, 1]
-        ax2.hist(final_returns, bins=80, color='#00BFFF', alpha=0.7, edgecolor='none')
-        ax2.axvline(0, color='white', lw=1, alpha=0.5)
-        ax2.axvline(np.median(final_returns), color='#00FF88', lw=2, ls='--',
-                    label=f'Median: {np.median(final_returns):+.1f}%')
-        ax2.set_title('Final Returns Distribution', fontsize=11)
-        ax2.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white')
-        ax2.grid(True, alpha=0.15, color='white')
-
-        # Max drawdown histogram
-        ax3 = axes[1, 0]
-        ax3.hist(max_drawdowns, bins=80, color='#FF4444', alpha=0.7, edgecolor='none')
-        ax3.axvline(np.median(max_drawdowns), color='#FFA500', lw=2, ls='--',
-                    label=f'Median: {np.median(max_drawdowns):.1f}%')
-        ax3.set_title('Max Drawdown Distribution', fontsize=11)
-        ax3.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white')
-        ax3.grid(True, alpha=0.15, color='white')
-
-        # Summary text
-        ax4 = axes[1, 1]
-        ax4.axis('off')
-        summary = (
-            f"Monte Carlo Summary\n{'─'*35}\n"
-            f"Runs: {MC_RUNS:,}  Trades: {n_trades}\n"
-            f"Leverage: {leverage}x\n"
-            f"ST({SUPERTREND_PERIOD},{SUPERTREND_MULT})  RSI({RSI_PERIOD_HTF},{HTF.upper()}) >{RSI_LONG_TH}/<{RSI_SHORT_TH}\n"
-            f"TF: {TIMEFRAME.upper()}\n{'─'*35}\n"
-            f"Prob Profit: {prob_profit:.1f}%\n"
-            f"Prob Blow-up: {prob_blow:.1f}%\n"
-            f"{'─'*35}\n"
-            f"       Return    Final$   MaxDD\n"
-        )
-        for i, p in enumerate(pcts):
-            summary += f"{p:>3}th {ret_p[i]:>+7.1f}% ${fin_p[i]:>7,.0f} {dd_p[i]:>6.1f}%\n"
-        ax4.text(0.05, 0.95, summary, transform=ax4.transAxes,
-                 fontsize=10, va='top', color='white', fontfamily='monospace',
-                 bbox=dict(boxstyle='round', facecolor='#0a0a1a', alpha=0.9))
-
-        plt.tight_layout()
-        mc_path = os.path.join(DESKTOP, "rsi_mean_revert_montecarlo.png")
-        plt.savefig(mc_path, dpi=150, bbox_inches='tight', facecolor='#0f0f0f')
-        print(f"\n  Monte Carlo chart: {mc_path}")
-        plt.show()
-
-    except Exception as e:
-        print(f"  MC chart error: {e}")
 
 
 if __name__ == "__main__":
