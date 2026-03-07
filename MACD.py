@@ -11,7 +11,8 @@ Strategy:
   Stop Loss    : LONG  — below last swing low (SWING_LOOKBACK bars) − ATR×ATR_SL_MULT
                  SHORT — above last swing high (SWING_LOOKBACK bars) + ATR×ATR_SL_MULT
 
-  Take Profit  : Fixed RR (entry ± RR_TARGET × risk distance)
+  Take Profit  : Fixed RR (entry ± RR_TARGET × risk distance) OR next MACD cross
+                 (toggleable via USE_MACD_CROSS_TP)
 
   Signal detected at bar i close → entry fills at bar i+1 open.
   One position at a time (no pyramiding).
@@ -47,32 +48,48 @@ DESKTOP = os.path.expanduser("~/Desktop")
 #  SETTINGS
 # ============================================================
 
-SYMBOL          = "BTCUSDT"
-TIMEFRAME       = "1h"
-START_DATE      = "2023-01-01"
+SYMBOL          = "ETHUSDT"
+TIMEFRAME       = "4h"
+START_DATE      = "2024-01-01"
 END_DATE        = "2025-01-01"
 INITIAL_CAPITAL = 2500
 
 # -- EMA (trend direction) ------------------------------------
-EMA_PERIOD      = 200        # price > EMA → bullish trend
+USE_TREND_FILTER = True     # Toggle trend filter on/off
+EMA_PERIOD      = 20      # price > EMA → bullish trend  (use 50-200; 10 is too noisy)
 
 # -- MACD (entry signal) --------------------------------------
 MACD_FAST       = 12
 MACD_SLOW       = 26
 MACD_SIGNAL_P   = 9
 
+# -- Direction filter -----------------------------------------
+LONGS_ONLY      = False       # True = only LONG signals (use in secular bull markets)
+SHORTS_ONLY     = False      # True = only SHORT signals
+
+# -- ADX Filter (skip low-trend / choppy markets) -------------
+ADX_ENABLED     = False
+ADX_PERIOD      = 14
+ADX_THRESHOLD   = 20        # only trade when ADX > this (20=mild trend, 25=strong)
+
+# -- Higher TF Alignment (HTF EMA confirms LTF direction) -----
+HTF_FILTER      = True       # True = only take longs when HTF EMA is bullish, shorts when bearish
+HTF_TIMEFRAME   = "1d"        # Higher timeframe (e.g. '4h', '1d', '12h')
+HTF_EMA_PERIOD  = 200         # EMA period on the HTF chart
+
 # -- Stop Loss ------------------------------------------------
 ATR_PERIOD      = 14
-ATR_SL_MULT     = 1.5        # SL = swing_low  − ATR_SL_MULT × ATR  (long)
-                              #      swing_high + ATR_SL_MULT × ATR  (short)
+ATR_SL_MULT     = 2.0        # SL = swing_low  − ATR_SL_MULT × ATR  (long)
+                              #      swing_highß + ATR_SL_MULT × ATR  (short)
 SWING_LOOKBACK  = 20         # bars to look back for swing high/low
 
 # -- Take Profit ----------------------------------------------
-RR_TARGET       = 2.0        # TP = entry ± RR_TARGET × risk
+USE_MACD_CROSS_TP = False     # If True, TP when MACD crosses Signal in opposite direction. If False, follows RR_TARGET
+RR_TARGET       = 2.0        # TP = entry ± RR_TARGET × risk (used if USE_MACD_CROSS_TP is False or as a hard TP if both hit)
 
 # -- Risk management ------------------------------------------
 RISK_PCT        = 0.02       # 2% of capital per trade (scaled by leverage)
-LEVERAGES       = [1, 3, 5, 10]
+LEVERAGES       = [1, 2, 3, 5, 10]
 
 # -- Costs (Binance USDT-M Futures) ---------------------------
 FEE_PER_SIDE            = 0.05
@@ -175,6 +192,27 @@ def calc_macd(close, fast=12, slow=26, signal=9):
     return macd_line, signal_line, histogram
 
 
+def calc_adx(df, period=14):
+    high  = df['High']
+    low   = df['Low']
+    close = df['Close']
+    tr1   = high - low
+    tr2   = (high - close.shift(1)).abs()
+    tr3   = (low  - close.shift(1)).abs()
+    tr    = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    up    = high.diff()
+    down  = -low.diff()
+    plus_dm  = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    alpha    = 1 / period
+    atr_s    = tr.ewm(alpha=alpha, min_periods=period).mean()
+    plus_di  = 100 * plus_dm.ewm(alpha=alpha,  min_periods=period).mean() / atr_s
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, min_periods=period).mean() / atr_s
+    denom    = (plus_di + minus_di).replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() / denom
+    return dx.ewm(alpha=alpha, min_periods=period).mean()
+
+
 def calc_atr(df, period=14):
     high  = df['High']
     low   = df['Low']
@@ -212,10 +250,20 @@ def run_backtest():
     print("=" * 72)
     print(f"  {SYMBOL}  |  MACD + EMA Strategy  |  {TIMEFRAME.upper()}")
     print(f"  Period   : {START_DATE} -> {END_DATE}  |  Capital: ${INITIAL_CAPITAL:,.0f}")
-    print(f"  Trend    : EMA({EMA_PERIOD})  —  price > EMA = LONG bias, < EMA = SHORT bias")
+    if USE_TREND_FILTER:
+        print(f"  Trend    : EMA({EMA_PERIOD})  —  price > EMA = LONG bias, < EMA = SHORT bias")
+    else:
+        print(f"  Trend    : OFF")
     print(f"  Signal   : MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P}) cross signal line")
+    adx_str = f"ADX({ADX_PERIOD})>{ADX_THRESHOLD}" if ADX_ENABLED else "OFF"
+    htf_str = f"{HTF_TIMEFRAME.upper()} EMA({HTF_EMA_PERIOD})" if HTF_FILTER else "OFF"
+    dir_str = "LONGS ONLY" if LONGS_ONLY else ("SHORTS ONLY" if SHORTS_ONLY else "BOTH")
+    print(f"  Filters  : ADX={adx_str}  |  HTF align={htf_str}  |  Direction={dir_str}")
     print(f"  SL       : Swing HL({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR({ATR_PERIOD})")
-    print(f"  TP       : Fixed {RR_TARGET}:1 RR")
+    if USE_MACD_CROSS_TP:
+        print(f"  TP       : Opposite MACD Cross")
+    else:
+        print(f"  TP       : Fixed {RR_TARGET}:1 RR")
     print(f"  Risk     : {RISK_PCT*100:.0f}% × leverage per trade")
     print(f"  Leverage : {' / '.join(f'{l}x' for l in LEVERAGES)}")
     print(f"  Fee      : {FEE_PER_SIDE}%/side  |  Funding: {FUNDING_RATE}%/{FUNDING_INTERVAL_HOURS}h "
@@ -230,13 +278,30 @@ def run_backtest():
         print("Download failed"); return
     df = tz_strip(df)
 
-    # ---- Indicators ----
+    # ---- HTF data for HTF alignment filter ----
+    df_htf = pd.DataFrame()
+    if HTF_FILTER:
+        df_htf = safe_download(SYMBOL, HTF_TIMEFRAME, warmup_start, END_DATE)
+        if df_htf.empty:
+            print(f"  {HTF_TIMEFRAME.upper()} download failed — HTF filter disabled")
+        else:
+            df_htf = tz_strip(df_htf)
+            df_htf['EMA_HTF'] = calc_ema(df_htf['Close'], HTF_EMA_PERIOD)
+            # HTF bull: close > HTF EMA. shift(1) → use last COMPLETED HTF bar only (no look-ahead)
+            df_htf['htf_bull'] = (df_htf['Close'] > df_htf['EMA_HTF']).shift(1)
+            df['htf_bull'] = df_htf['htf_bull'].reindex(df.index, method='ffill')
+
+    if df_htf.empty or not HTF_FILTER:
+        df['htf_bull'] = True   # no filter → allow all
+
+    # ---- 1H Indicators ----
     df['EMA']        = calc_ema(df['Close'], EMA_PERIOD)
     macd, sig, hist  = calc_macd(df['Close'], MACD_FAST, MACD_SLOW, MACD_SIGNAL_P)
     df['MACD']       = macd
     df['Signal']     = sig
     df['Hist']       = hist
     df['ATR']        = calc_atr(df, ATR_PERIOD)
+    df['ADX']        = calc_adx(df, ADX_PERIOD)
 
     # Rolling swing high / low (look back only, include current bar)
     df['swing_low']  = df['Low'].rolling(SWING_LOOKBACK).min()
@@ -267,8 +332,8 @@ def run_backtest():
     position   = None
     entry_info = None
 
-    required_cols = ['EMA', 'MACD', 'Signal', 'ATR', 'swing_low', 'swing_high',
-                     'cross_up', 'cross_dn']
+    required_cols = ['EMA', 'MACD', 'Signal', 'ATR', 'ADX', 'swing_low', 'swing_high',
+                     'cross_up', 'cross_dn', 'htf_bull']
 
     # Loop to start_idx+1 so we can always read i+1 for entry fill
     for i in range(start_idx, len(df) - 1):
@@ -282,10 +347,12 @@ def run_backtest():
         close      = float(row['Close'])
         ema        = float(row['EMA'])
         atr        = float(row['ATR'])
+        adx        = float(row['ADX'])
         swing_lo   = float(row['swing_low'])
         swing_hi   = float(row['swing_high'])
         cross_up   = bool(row['cross_up'])
         cross_dn   = bool(row['cross_dn'])
+        htf_bull   = bool(row['htf_bull'])
 
         # ---- 1. Manage open position ----
         if position is not None and entry_info is not None:
@@ -300,13 +367,17 @@ def run_backtest():
             if position == 'LONG':
                 if l <= sl:
                     exit_price, outcome = sl, 'SL'
-                elif h >= tp:
-                    exit_price, outcome = tp, 'TP'
+                elif USE_MACD_CROSS_TP and cross_dn:
+                    exit_price, outcome = float(next_bar['Open']), 'TP MACD Cross'
+                elif tp is not None and h >= tp:
+                    exit_price, outcome = tp, 'TP (Fixed)'
             else:
                 if h >= sl:
                     exit_price, outcome = sl, 'SL'
-                elif l <= tp:
-                    exit_price, outcome = tp, 'TP'
+                elif USE_MACD_CROSS_TP and cross_up:
+                    exit_price, outcome = float(next_bar['Open']), 'TP MACD Cross'
+                elif tp is not None and l <= tp:
+                    exit_price, outcome = tp, 'TP (Fixed)'
 
             if exit_price is not None:
                 signals.append({
@@ -326,20 +397,28 @@ def run_backtest():
             sl          = None
             tp          = None
 
-            # LONG: price > EMA + MACD crosses up
-            if close > ema and cross_up:
+            trend_long  = (close > ema) if USE_TREND_FILTER else True
+            trend_short = (close < ema) if USE_TREND_FILTER else True
+            adx_ok      = (adx > ADX_THRESHOLD) if ADX_ENABLED else True
+            can_long    = not SHORTS_ONLY
+            can_short   = not LONGS_ONLY
+
+            # LONG: price > EMA + ADX trending + 4H bull + MACD crosses up
+            if can_long and trend_long and adx_ok and htf_bull and cross_up:
                 sl = swing_lo - ATR_SL_MULT * atr
                 if entry_price > sl:
                     risk = entry_price - sl
-                    tp   = entry_price + RR_TARGET * risk
+                    if not USE_MACD_CROSS_TP:
+                        tp = entry_price + RR_TARGET * risk
                     direction = 'LONG'
 
-            # SHORT: price < EMA + MACD crosses down
-            elif close < ema and cross_dn:
+            # SHORT: price < EMA + ADX trending + 4H bear + MACD crosses down
+            elif can_short and trend_short and adx_ok and (not htf_bull) and cross_dn:
                 sl = swing_hi + ATR_SL_MULT * atr
                 if entry_price < sl:
                     risk = sl - entry_price
-                    tp   = entry_price - RR_TARGET * risk
+                    if not USE_MACD_CROSS_TP:
+                        tp = entry_price - RR_TARGET * risk
                     direction = 'SHORT'
 
             if direction is not None:
@@ -349,7 +428,7 @@ def run_backtest():
                     'entry_time':  df.index[i + 1],
                     'signal_time': t,
                     'sl':          float(sl),
-                    'tp':          float(tp),
+                    'tp':          float(tp) if tp is not None else float('nan'),
                     'atr':         float(atr),
                     'swing_lo':    float(swing_lo),
                     'swing_hi':    float(swing_hi),
@@ -532,8 +611,10 @@ def run_backtest():
 
     print(f"\n{'='*total_w}")
     print(f"  {SYMBOL}  |  MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL_P}) + EMA({EMA_PERIOD})  |  {TIMEFRAME.upper()}")
-    print(f"  Trend: price vs EMA({EMA_PERIOD})  |  Signal: MACD cross")
-    print(f"  SL: Swing({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR  |  TP: {RR_TARGET}:1 RR  |  Risk: {RISK_PCT*100:.0f}%×lev")
+    trend_str = f"price vs EMA({EMA_PERIOD})" if USE_TREND_FILTER else "OFF"
+    print(f"  Trend: {trend_str}  |  Signal: MACD cross")
+    tp_str = f"Opposite MACD Cross" if USE_MACD_CROSS_TP else f"{RR_TARGET}:1 RR"
+    print(f"  SL: Swing({SWING_LOOKBACK}) ± {ATR_SL_MULT}×ATR  |  TP: {tp_str}  |  Risk: {RISK_PCT*100:.0f}%×lev")
     print(f"  Time in market: {in_market_pct:.1f}%")
     print(f"{'='*total_w}")
 

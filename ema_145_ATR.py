@@ -53,8 +53,8 @@ DESKTOP = os.path.expanduser("~/Desktop")
 # ╚═════════════════════════════════════════════════════════════╝
 
 SYMBOL          = "ETHUSDT"
-START_DATE      = "2024-01-01"
-END_DATE        = "2024-03-04"
+START_DATE      = "2023-07-01"
+END_DATE        = "2023-12-04"
 INITIAL_CAPITAL = 2500
 
 # ── EMA ────────────────────────────────────────

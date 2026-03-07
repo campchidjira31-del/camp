@@ -53,32 +53,33 @@ SYMBOL          = "ETHUSDT"
 TIMEFRAME       = "1h"        # Current / lower trading TF
 HTF             = "4h"        # Higher TF for RSI, SuperTrend, ADX
 START_DATE      = "2023-01-01"
-END_DATE        = "2025-08-01"   # "" = today
+END_DATE        = "2023-08-01"   # "" = today
 INITIAL_CAPITAL = 2500
 
 # -- Higher TF (4H) indicators --------------------------------
+USE_HTF_FILTER      = True    # Toggle all 4H filters on/off
 RSI_PERIOD_HTF      = 14
-RSI_LONG_TH         = 65      # 4H RSI > 70  -> LONG condition
-RSI_SHORT_TH        = 35      # 4H RSI < 30  -> SHORT condition
+RSI_LONG_TH         = 51      # 4H RSI > 70  -> LONG condition
+RSI_SHORT_TH        = 49      # 4H RSI < 30  -> SHORT condition
 
 SUPERTREND_PERIOD   = 10
-SUPERTREND_MULT     = 2.0
+SUPERTREND_MULT     = 1.0
 
 ADX_PERIOD_HTF      = 25
-ADX_TH_HTF          = 25      # 4H ADX must exceed this
+ADX_TH_HTF          = 5      # 4H ADX must exceed this
 
 # -- Current TF indicators ------------------------------------
 ADX_PERIOD          = 14
-ADX_TH              = 10      # Current TF ADX must exceed this
+ADX_TH              = 20      # Current TF ADX must be BELOW this (ranging market)
 
-RSI_PERIOD_LTF      = 14
-RSI_LTF_LONG_MAX    = 40     # LTF RSI must be below this to confirm long pullback
-RSI_LTF_SHORT_MIN   = 60     # LTF RSI must be above this to confirm short pullback
+RSI_PERIOD_LTF      = 2
+RSI_LTF_LONG_MAX    = 10     # LTF RSI must be below this to confirm long pullback
+RSI_LTF_SHORT_MIN   = 90     # LTF RSI must be above this to confirm short pullback
 
-TIME_STOP_BARS      = 600     # Close trade after N bars if no SL/TP hit
+TIME_STOP_BARS      = 120      # Close trade after N bars if no SL/TP hit (~2 days)
 
 BB_PERIOD           = 20
-BB_STD              = 2.0
+BB_STD              = 3.0     # Wider bands = fewer but higher-quality entries
 
 ATR_PERIOD          = 14
 ATR_SL_MULT         = 1.5    # SL = entry +/- ATR_SL_MULT * ATR
@@ -308,9 +309,12 @@ def run_backtest():
     print("=" * 72)
     print(f"  {SYMBOL}  |  SuperTrend + RSI({HTF.upper()}) + ADX + Bollinger Bands  |  {TIMEFRAME.upper()}")
     print(f"  Period   : {START_DATE} -> {END_DATE}  |  Capital: ${INITIAL_CAPITAL:,.0f}")
-    print(f"  HTF ({HTF.upper()}) : SuperTrend({SUPERTREND_PERIOD},{SUPERTREND_MULT})  "
-          f"RSI>{RSI_LONG_TH} LONG / <{RSI_SHORT_TH} SHORT  ADX>{ADX_TH_HTF}")
-    print(f"  LTF ({TIMEFRAME.upper()}) : ADX>{ADX_TH}  |  BB({BB_PERIOD},{BB_STD})  |  "
+    if USE_HTF_FILTER:
+        print(f"  HTF ({HTF.upper()}) : SuperTrend({SUPERTREND_PERIOD},{SUPERTREND_MULT})  "
+              f"RSI>{RSI_LONG_TH} LONG / <{RSI_SHORT_TH} SHORT  ADX>{ADX_TH_HTF}")
+    else:
+        print(f"  HTF ({HTF.upper()}) : OFF")
+    print(f"  LTF ({TIMEFRAME.upper()}) : ADX<{ADX_TH}  |  BB({BB_PERIOD},{BB_STD})  |  "
           f"SL = entry +/- {ATR_SL_MULT}x ATR({ATR_PERIOD})")
     print(f"  Entry    : LONG @ Lower BB  /  SHORT @ Upper BB")
     print(f"  TP       : LONG @ Upper BB  /  SHORT @ Lower BB  (dynamic)")
@@ -350,20 +354,18 @@ def run_backtest():
     df_ltf['BB_lower'] = bb_lo
 
     # ---- Merge HTF indicators into LTF via forward-fill ----
-    # IMPORTANT: shift(1) on the HTF frame before reindexing.
-    # A 4H bar at open_time T uses OHLC data up to T+4h (its close).
-    # Without shift, the 1H bars at T, T+1h, T+2h, T+3h would receive
-    # an indicator that includes their own future data (look-ahead).
-    # shift(1) ensures only the PREVIOUS completed 4H bar's value is used.
-    df_ltf['HTF_RSI']      = df_htf['RSI'].shift(1).reindex(df_ltf.index, method='ffill')
-    df_ltf['HTF_ADX']      = df_htf['ADX'].shift(1).reindex(df_ltf.index, method='ffill')
-    df_ltf['HTF_ST_trend'] = df_htf['ST_trend'].shift(1).reindex(df_ltf.index, method='ffill')
+    if USE_HTF_FILTER:
+        df_ltf['HTF_RSI']      = df_htf['RSI'].shift(1).reindex(df_ltf.index, method='ffill')
+        df_ltf['HTF_ADX']      = df_htf['ADX'].shift(1).reindex(df_ltf.index, method='ffill')
+        df_ltf['HTF_ST_trend'] = df_htf['ST_trend'].shift(1).reindex(df_ltf.index, method='ffill')
+    else:
+        df_ltf['HTF_RSI']      = 50
+        df_ltf['HTF_ADX']      = 100
+        df_ltf['HTF_ST_trend'] = 1  # default to allowing longs/shorts depending on logic
 
     # ---- Shift current-TF signals by 1 bar to fix look-ahead bias ----
-    # All current-TF indicators are computed from bar i's CLOSE.
-    # In live trading you only know bar i's close AFTER it closes, so
-    # entry/exit decisions must use values from the previous bar (shift 1).
     df_ltf['BB_upper_s']  = df_ltf['BB_upper'].shift(1)
+    df_ltf['BB_mid_s']    = df_ltf['BB_mid'].shift(1)
     df_ltf['BB_lower_s']  = df_ltf['BB_lower'].shift(1)
     df_ltf['ADX_s']       = df_ltf['ADX'].shift(1)
     df_ltf['ATR_s']       = df_ltf['ATR'].shift(1)
@@ -390,7 +392,7 @@ def run_backtest():
     position   = None
     entry_info = None
 
-    required_cols = ['ATR_s', 'ADX_s', 'BB_upper_s', 'BB_lower_s',
+    required_cols = ['ATR_s', 'ADX_s', 'BB_upper_s', 'BB_mid_s', 'BB_lower_s',
                      'HTF_RSI', 'HTF_ADX', 'HTF_ST_trend', 'RSI_ltf_s']
 
     for i in range(start_idx, len(df_ltf)):
@@ -404,6 +406,7 @@ def run_backtest():
         t        = df_ltf.index[i]
         atr      = row['ATR_s']       # previous bar's ATR for SL sizing
         bb_upper = row['BB_upper_s']  # previous bar's upper BB
+        bb_mid   = row['BB_mid_s']    # previous bar's middle BB
         bb_lower = row['BB_lower_s']  # previous bar's lower BB
         adx      = row['ADX_s']       # previous bar's ADX
 
@@ -421,8 +424,12 @@ def run_backtest():
             bars_held = i - entry_info['entry_bar']
 
             # SuperTrend flip: HTF trend reversed against our position
-            st_flip = (position == 'LONG'  and htf_trend == -1) or \
-                      (position == 'SHORT' and htf_trend ==  1)
+            if USE_HTF_FILTER:
+                st_flip = (position == 'LONG'  and htf_trend == -1) or \
+                          (position == 'SHORT' and htf_trend ==  1)
+            else:
+                st_flip = False
+
             # Time stop
             time_stop = bars_held >= TIME_STOP_BARS
 
@@ -460,9 +467,14 @@ def run_backtest():
 
         # ---- 2. Look for new entry ----
         if position is None:
-            bull_htf = (htf_trend == 1  and htf_rsi > RSI_LONG_TH  and htf_adx > ADX_TH_HTF)
-            bear_htf = (htf_trend == -1 and htf_rsi < RSI_SHORT_TH and htf_adx > ADX_TH_HTF)
-            adx_ok   = adx > ADX_TH
+            if USE_HTF_FILTER:
+                bull_htf = (htf_trend == 1  and htf_rsi > RSI_LONG_TH  and htf_adx > ADX_TH_HTF)
+                bear_htf = (htf_trend == -1 and htf_rsi < RSI_SHORT_TH and htf_adx > ADX_TH_HTF)
+            else:
+                bull_htf = True
+                bear_htf = True
+
+            adx_ok   = adx < ADX_TH
 
             direction   = None
             entry_price = None
