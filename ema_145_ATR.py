@@ -34,8 +34,14 @@ from datetime import datetime, timedelta
 try:
     import requests
 except ImportError:
-    print("❌ ติดตั้งก่อน: pip3 install requests pandas numpy matplotlib")
+    print("❌ ติดตั้งก่อน: pip3 install requests pandas numpy matplotlib hmmlearn")
     sys.exit(1)
+
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HAS_HMM = True
+except ImportError:
+    HAS_HMM = False
 
 try:
     import matplotlib
@@ -52,25 +58,25 @@ DESKTOP = os.path.expanduser("~/Desktop")
 # ║                  SETTINGS ปรับตรงนี้                        ║
 # ╚═════════════════════════════════════════════════════════════╝
 
-SYMBOL          = "ETHUSDT"
-START_DATE      = "2023-07-01"
-END_DATE        = "2023-12-04"
+SYMBOL          = "BTCUSDT"
+START_DATE      = "2022-01-01"
+END_DATE        = "2026-01-01"
 INITIAL_CAPITAL = 2500
 
 # ── EMA ────────────────────────────────────────
-EMA_PERIOD      = 145
+EMA_PERIOD      = 150
 
 # ── Leverage (ใช้ตัวเดียวสำหรับ A/B comparison) ──
 LEVERAGE        = 3                  # เทียบ 1x ก่อน (เห็น edge ชัด)
 
 # ── Filter 1: ADX Trend Strength ──────────────
-ADX_ENABLED     = False               # เปิด/ปิด ADX filter
+ADX_ENABLED     = True               # เปิด/ปิด ADX filter
 ADX_PERIOD      = 14
 ADX_THRESHOLD   = 20                 # ADX > 20 = trending, < 20 = sideways
                                      # ลอง 15, 20, 25
 
 # ── Filter 2: ATR Volatility Gate ─────────────
-ATR_ENABLED     = True               # เปิด/ปิด ATR filter
+ATR_ENABLED     = False               # เปิด/ปิด ATR filter
 ATR_PERIOD      = 14
 ATR_MA_PERIOD   = 60                 # MA ของ ATR (baseline)
 ATR_MULTIPLIER  = 0.9                # ATR ปัจจุบัน > ATR_MA × multiplier
@@ -82,6 +88,16 @@ FEE_PER_SIDE    = 0.05
 FUNDING_RATE    = 0.01
 FUNDING_INTERVAL_HOURS = 8      # Binance USDT-M ETH/BTC funds every 8h (not 4h)
 INTEREST_RATE_DAILY = 0.00
+
+# ── HMM Regime Filter ────────────────────────
+HMM_ENABLED           = False        # master switch
+HMM_N_STATES          = 3           # BEAR / SIDEWAYS / BULL
+HMM_COVARIANCE_TYPE   = 'full'
+HMM_N_ITER            = 100
+HMM_RANDOM_STATE      = 42
+HMM_USE_FUNDING       = True        # include funding rate as feature
+HMM_LONG_IN_BULL_ONLY = True        # LONG only when regime = BULL
+HMM_SHORT_IN_BEAR_ONLY = False      # SHORT only when regime = BEAR (False = allow in BEAR+SIDEWAYS)
 
 # ── Monte Carlo ───────────────────────────────
 MC_ENABLED      = False
@@ -234,6 +250,137 @@ def calc_holding_costs(direction, notional, holding_hours):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Funding Rate Download
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def download_funding_rates(symbol, start_str, end_str):
+    """Download historical funding rates from Binance Futures API."""
+    url = "https://fapi.binance.com/fapi/v1/fundingRate"
+    start_ms = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
+    end_ms   = int(datetime.strptime(end_str,   "%Y-%m-%d").timestamp() * 1000)
+    all_data = []
+    cursor   = start_ms
+    print(f"\n📥 Funding rates ({start_str} → {end_str})...")
+    while cursor < end_ms:
+        params = {'symbol': symbol, 'startTime': cursor, 'endTime': end_ms, 'limit': 1000}
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"   Funding API error: {e}"); break
+        if not data:
+            break
+        all_data.extend(data)
+        cursor = data[-1]['fundingTime'] + 1
+        if len(data) < 1000:
+            break
+        time.sleep(0.1)
+
+    if not all_data:
+        print("   ⚠️  No funding data"); return pd.Series(dtype=float)
+
+    df_fr = pd.DataFrame(all_data)
+    df_fr['fundingRate'] = df_fr['fundingRate'].astype(float)
+    df_fr.index = pd.to_datetime(df_fr['fundingTime'], unit='ms')
+    df_fr = df_fr[~df_fr.index.duplicated(keep='first')].sort_index()
+    print(f"   ✅ {len(df_fr)} funding snapshots")
+    return df_fr['fundingRate']
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  HMM Market Regime Detector
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class MarketRegimeHMM:
+    """
+    Gaussian Hidden Markov Model for market regime classification.
+    States sorted by mean return: 0=BEAR, 1=SIDEWAYS, 2=BULL.
+    Solves the label-switching problem by post-hoc sorting.
+    """
+
+    REGIME_LABELS  = {0: 'BEAR', 1: 'SIDEWAYS', 2: 'BULL'}
+    REGIME_COLORS  = {0: '#FF4444', 1: '#FFAA00', 2: '#00FF88'}
+
+    def __init__(self, n_states=3, covariance_type='full', n_iter=100, random_state=42):
+        self.n_states = n_states
+        self.covariance_type = covariance_type
+        self.n_iter = n_iter
+        self.random_state = random_state
+        self.model = None
+        self.state_map = None
+
+    @staticmethod
+    def prepare_features(df, funding_sr=None):
+        """
+        Build feature matrix for HMM:
+          - log returns of Close
+          - normalized funding rate (optional)
+        Returns (features_df, valid_index). Drops NaN rows.
+        """
+        features = pd.DataFrame(index=df.index)
+        features['log_ret'] = np.log(df['Close'] / df['Close'].shift(1))
+
+        if funding_sr is not None and len(funding_sr) > 0:
+            fr_aligned = funding_sr.reindex(df.index, method='ffill')
+            fr_mean = fr_aligned.rolling(50, min_periods=10).mean()
+            fr_std  = fr_aligned.rolling(50, min_periods=10).std().replace(0, 1)
+            features['funding_z'] = (fr_aligned - fr_mean) / fr_std
+            features['funding_z'] = features['funding_z'].fillna(0)
+
+        features = features.dropna()
+        return features
+
+    def fit(self, features_df):
+        """Fit HMM and sort states by mean log-return (label-switching fix)."""
+        if not HAS_HMM:
+            raise ImportError("hmmlearn not installed: pip3 install hmmlearn")
+
+        X = features_df.values
+        self.model = GaussianHMM(
+            n_components=self.n_states,
+            covariance_type=self.covariance_type,
+            n_iter=self.n_iter,
+            random_state=self.random_state,
+            verbose=False,
+        )
+        self.model.fit(X)
+
+        # Sort states by mean of feature 0 (log return): ascending → BEAR, SIDEWAYS, BULL
+        mean_returns = self.model.means_[:, 0]
+        sorted_idx   = np.argsort(mean_returns)
+        self.state_map = {int(orig): new for new, orig in enumerate(sorted_idx)}
+
+        print(f"   HMM converged: {self.model.monitor_.converged}")
+        for orig in sorted_idx:
+            mapped = self.state_map[orig]
+            mr = mean_returns[orig]
+            print(f"     State {mapped} ({self.REGIME_LABELS[mapped]:>8}): "
+                  f"mean_logret = {mr:+.5f}")
+        return self
+
+    def predict(self, features_df):
+        """Predict regime for each row. Returns Series (0=BEAR, 1=SIDEWAYS, 2=BULL)."""
+        X = features_df.values
+        raw = self.model.predict(X)
+        mapped = np.array([self.state_map[int(s)] for s in raw])
+        return pd.Series(mapped, index=features_df.index, name='regime')
+
+    def predict_proba(self, features_df):
+        """Posterior probability of each regime. Columns reordered to sorted states."""
+        X = features_df.values
+        raw_proba = self.model.predict_proba(X)
+        sorted_proba = np.zeros_like(raw_proba)
+        for orig, new in self.state_map.items():
+            sorted_proba[:, new] = raw_proba[:, orig]
+        return pd.DataFrame(sorted_proba, index=features_df.index,
+                            columns=['p_bear', 'p_sideways', 'p_bull'])
+
+    def get_label(self, state):
+        return self.REGIME_LABELS.get(state, 'UNKNOWN')
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Signal Generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -304,7 +451,19 @@ def generate_signals(df, start_idx, use_filters=False):
                 elif atr_val < atr_ma * ATR_MULTIPLIER:
                     atr_ok = False
 
-            filters_pass = adx_ok and atr_ok
+            hmm_ok = True
+            if HMM_ENABLED:
+                regime = row.get('HMM_regime', np.nan)
+                if pd.isna(regime):
+                    hmm_ok = False
+                else:
+                    regime = int(regime)
+                    if ema_dir == 'LONG' and HMM_LONG_IN_BULL_ONLY and regime != 2:
+                        hmm_ok = False
+                    if ema_dir == 'SHORT' and HMM_SHORT_IN_BEAR_ONLY and regime != 0:
+                        hmm_ok = False
+
+            filters_pass = adx_ok and atr_ok and hmm_ok
 
             if ema_dir != current_dir:
                 # Direction change
@@ -548,6 +707,8 @@ def run_ab_comparison():
         filter_desc.append(f"ADX({ADX_PERIOD})>{ADX_THRESHOLD}")
     if ATR_ENABLED:
         filter_desc.append(f"ATR({ATR_PERIOD})>MA({ATR_MA_PERIOD})×{ATR_MULTIPLIER}")
+    if HMM_ENABLED:
+        filter_desc.append(f"HMM({HMM_N_STATES}st)")
     filter_str = " + ".join(filter_desc) if filter_desc else "None"
 
     print("=" * 75)
@@ -575,7 +736,64 @@ def run_ab_comparison():
     df['ATR_MA'] = df['ATR'].rolling(ATR_MA_PERIOD).mean()
 
     warmup_bars = len(df[df.index < pd.Timestamp(START_DATE)])
-    print(f"\n📐 Warmup: {warmup_bars} แท่ง = {warmup_bars/EMA_PERIOD:.1f}x EMA period")
+    print(f"\n📐 Warmup: {warmup_bars} bars = {warmup_bars/EMA_PERIOD:.1f}x EMA period")
+
+    # ---- HMM Regime Detection ----
+    hmm_model = None
+    funding_sr = None
+    if HMM_ENABLED:
+        if not HAS_HMM:
+            print("❌ hmmlearn not installed. pip3 install hmmlearn")
+            print("   Disabling HMM filter.")
+            df['HMM_regime'] = np.nan
+        else:
+            # Download funding rates
+            if HMM_USE_FUNDING:
+                funding_sr = download_funding_rates(SYMBOL, warmup_start, END_DATE)
+                if funding_sr.index.tz is not None:
+                    funding_sr.index = funding_sr.index.tz_convert(None)
+
+            # Prepare features
+            hmm_model = MarketRegimeHMM(
+                n_states=HMM_N_STATES,
+                covariance_type=HMM_COVARIANCE_TYPE,
+                n_iter=HMM_N_ITER,
+                random_state=HMM_RANDOM_STATE,
+            )
+            features = hmm_model.prepare_features(
+                df, funding_sr if HMM_USE_FUNDING else None
+            )
+
+            # Walk-forward: fit on warmup data only, predict on full dataset
+            bt_boundary = pd.Timestamp(START_DATE)
+            warmup_features = features[features.index < bt_boundary]
+            if len(warmup_features) < 30:
+                print(f"   ⚠️  Only {len(warmup_features)} warmup bars for HMM — need ≥ 30")
+                print("   Fitting on all available data (in-sample warning).")
+                warmup_features = features
+
+            print(f"\n🧠 Fitting HMM ({HMM_N_STATES} states) on {len(warmup_features)} warmup bars...")
+            hmm_model.fit(warmup_features)
+
+            # Predict on full dataset (parameters frozen from warmup fit)
+            regimes = hmm_model.predict(features)
+
+            # Shift by 1 bar — regime at bar i uses data through bar i-1 (no look-ahead)
+            regimes_shifted = regimes.shift(1)
+            df['HMM_regime'] = regimes_shifted.reindex(df.index)
+
+            # Unshifted for visualization (shows "true" regime at each bar)
+            df['HMM_regime_raw'] = regimes.reindex(df.index)
+
+            # Regime stats
+            bt_regimes = df.loc[df.index >= bt_boundary, 'HMM_regime'].dropna()
+            if len(bt_regimes) > 0:
+                for s in range(HMM_N_STATES):
+                    ct = (bt_regimes == s).sum()
+                    pct = ct / len(bt_regimes) * 100
+                    print(f"   Backtest: {hmm_model.get_label(s):>8} = {ct:>4} bars ({pct:.1f}%)")
+    else:
+        df['HMM_regime'] = np.nan
 
     bt_start = max(pd.Timestamp(START_DATE), df.index[0])
     df_bt = df[df.index >= bt_start].copy()
@@ -833,19 +1051,165 @@ def run_ab_comparison():
     except Exception as e:
         print(f"  ⚠️  Chart error: {e}")
 
-    print("\n✅ A/B Comparison เสร็จสิ้น!")
+    print("\n✅ A/B Comparison done!")
+
+    # ========== HMM REGIME CHART ==========
+    if HMM_ENABLED and hmm_model is not None and HAS_PLOT:
+        plot_hmm_analysis(df, df_bt, a, b, hmm_model, funding_sr, filter_str)
 
     # ========== MONTE CARLO (both) ==========
     if MC_ENABLED:
         run_monte_carlo_ab(a, b)
 
     print(f"\n💡 Tips:")
-    print(f"   - ADX_THRESHOLD = {ADX_THRESHOLD} (ลอง 15, 20, 25, 30)")
-    print(f"   - ATR_MULTIPLIER = {ATR_MULTIPLIER} (ลอง 0.5, 0.8, 1.0, 1.2)")
-    print(f"   - ปิด filter: ADX_ENABLED=False / ATR_ENABLED=False")
-    print(f"   - ลอง LEVERAGE = 2 หรือ 3 เพื่อดู amplified effect")
-    print(f"ข้อมูลเริ่มตั้งแต่วันที่: {df.index.min()}")
-    print(f"ข้อมูลสิ้นสุดวันที่: {df.index.max()}") 
+    if HMM_ENABLED:
+        print(f"   - HMM_LONG_IN_BULL_ONLY = {HMM_LONG_IN_BULL_ONLY}")
+        print(f"   - HMM_SHORT_IN_BEAR_ONLY = {HMM_SHORT_IN_BEAR_ONLY}")
+        print(f"   - HMM_USE_FUNDING = {HMM_USE_FUNDING}")
+    print(f"   - ADX_THRESHOLD = {ADX_THRESHOLD} (try 15, 20, 25, 30)")
+    print(f"   - ATR_MULTIPLIER = {ATR_MULTIPLIER} (try 0.5, 0.8, 1.0, 1.2)")
+    print(f"   - Disable filter: ADX_ENABLED=False / ATR_ENABLED=False / HMM_ENABLED=False")
+    print(f"Data: {df.index.min()} → {df.index.max()}") 
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  HMM Regime Visualization
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def plot_hmm_analysis(df, df_bt, result_a, result_b, hmm_model, funding_sr, filter_str):
+    """
+    3-panel HMM chart:
+      Panel 1: Price + EMA with regime background + Original vs Filtered signals
+      Panel 2: Hidden states (0=BEAR, 1=SIDEWAYS, 2=BULL) color-coded
+      Panel 3: Funding rate aligned with regimes
+    """
+    try:
+        fig, axes = plt.subplots(3, 1, figsize=(20, 14),
+                                 gridspec_kw={'height_ratios': [3, 1, 1.2]},
+                                 sharex=True)
+        fig.patch.set_facecolor('#0f0f0f')
+        for ax in axes:
+            ax.set_facecolor('#1a1a2e')
+            ax.tick_params(colors='#cccccc')
+            ax.yaxis.label.set_color('#cccccc')
+            ax.xaxis.label.set_color('#cccccc')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#333355')
+
+        fig.suptitle(
+            f'{SYMBOL}  EMA {EMA_PERIOD} — HMM Regime Analysis ({HMM_N_STATES} states)\n'
+            f'{START_DATE} → {END_DATE}  |  4H  |  {LEVERAGE}x',
+            fontsize=12, fontweight='bold', color='white'
+        )
+
+        # ── Panel 1: Price + EMA + regime background + signals ──
+        ax1 = axes[0]
+
+        # Regime background shading (use raw/unshifted for visual truth)
+        regime_col = 'HMM_regime_raw' if 'HMM_regime_raw' in df_bt.columns else 'HMM_regime'
+        regimes_bt = df_bt[regime_col].dropna()
+        if len(regimes_bt) > 0:
+            for state, color in MarketRegimeHMM.REGIME_COLORS.items():
+                mask = regimes_bt == state
+                if mask.any():
+                    starts = mask.index[mask & ~mask.shift(1, fill_value=False)]
+                    ends   = mask.index[mask & ~mask.shift(-1, fill_value=False)]
+                    for s, e in zip(starts, ends):
+                        ax1.axvspan(s, e, alpha=0.12, color=color)
+
+        # Price + EMA
+        ax1.plot(df_bt.index, df_bt['Close'], color='white', lw=1.5, label='Close', zorder=2)
+        ax1.plot(df_bt.index, df_bt['EMA'], color='#FFD700', lw=1.2, ls='--',
+                 label=f'EMA({EMA_PERIOD})', alpha=0.8, zorder=2)
+
+        # Plot signals: [A] Original (all) vs [B] Filtered (HMM-gated)
+        a_trades = result_a['df_t']
+        b_trades = result_b['df_t']
+
+        # [A] Original entries — small gray dots
+        for _, tr in a_trades.iterrows():
+            clr = '#FF6B6B' if tr['direction'] == 'LONG' else '#6B9FFF'
+            ax1.scatter(tr['entry_time'], tr['entry_price'], color=clr, s=15,
+                        alpha=0.3, zorder=3, marker='^' if tr['direction'] == 'LONG' else 'v')
+
+        # [B] Filtered entries — larger bright markers
+        for _, tr in b_trades.iterrows():
+            clr = '#00FF88' if tr['direction'] == 'LONG' else '#FF44FF'
+            mkr = '^' if tr['direction'] == 'LONG' else 'v'
+            ax1.scatter(tr['entry_time'], tr['entry_price'], color=clr, s=60,
+                        edgecolors='white', linewidths=0.5, zorder=4, marker=mkr)
+
+        # Legend entries
+        ax1.scatter([], [], color='#FF6B6B', s=15, alpha=0.3, marker='^', label='[A] Long (all)')
+        ax1.scatter([], [], color='#6B9FFF', s=15, alpha=0.3, marker='v', label='[A] Short (all)')
+        ax1.scatter([], [], color='#00FF88', s=60, marker='^', edgecolors='white',
+                    linewidths=0.5, label='[B] Long (filtered)')
+        ax1.scatter([], [], color='#FF44FF', s=60, marker='v', edgecolors='white',
+                    linewidths=0.5, label='[B] Short (filtered)')
+
+        # Regime legend
+        for state in range(HMM_N_STATES):
+            ax1.fill_between([], [], alpha=0.2, color=MarketRegimeHMM.REGIME_COLORS[state],
+                             label=MarketRegimeHMM.REGIME_LABELS[state])
+
+        ax1.set_ylabel('Price (USD)', fontsize=11)
+        ax1.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white',
+                   loc='upper left', ncol=3)
+        ax1.grid(True, alpha=0.15, color='white')
+
+        # ── Panel 2: Hidden States over time ──
+        ax2 = axes[1]
+        if len(regimes_bt) > 0:
+            colors_map = {0: '#FF4444', 1: '#FFAA00', 2: '#00FF88'}
+            bar_colors = [colors_map.get(int(v), '#888888') for v in regimes_bt.values]
+            ax2.bar(regimes_bt.index, regimes_bt.values + 0.5, width=0.2,
+                    color=bar_colors, alpha=0.8)
+            ax2.set_yticks([0.5, 1.5, 2.5])
+            ax2.set_yticklabels(['BEAR', 'SIDEWAYS', 'BULL'], fontsize=9, color='white')
+            ax2.set_ylim(-0.2, 3.2)
+        ax2.set_ylabel('HMM State', fontsize=11)
+        ax2.grid(True, alpha=0.15, color='white')
+
+        # ── Panel 3: Funding Rate aligned with regimes ──
+        ax3 = axes[2]
+        if funding_sr is not None and len(funding_sr) > 0:
+            fr_bt = funding_sr.reindex(df_bt.index, method='ffill').dropna()
+            if len(fr_bt) > 0:
+                fr_pct = fr_bt * 100  # convert to percentage
+                # Color by regime
+                regimes_for_fr = df[regime_col].reindex(fr_bt.index, method='ffill')
+                pos_mask = fr_pct >= 0
+                ax3.bar(fr_bt.index[pos_mask], fr_pct[pos_mask], width=0.15,
+                        color='#00FF88', alpha=0.6)
+                ax3.bar(fr_bt.index[~pos_mask], fr_pct[~pos_mask], width=0.15,
+                        color='#FF4444', alpha=0.6)
+                ax3.axhline(0, color='white', lw=0.5, alpha=0.5)
+                ax3.set_ylabel('Funding Rate (%)', fontsize=11)
+
+                # Add regime background to funding panel too
+                for state, color in MarketRegimeHMM.REGIME_COLORS.items():
+                    mask = regimes_for_fr == state
+                    valid_mask = mask.dropna()
+                    if valid_mask.any():
+                        starts = valid_mask.index[valid_mask & ~valid_mask.shift(1, fill_value=False)]
+                        ends   = valid_mask.index[valid_mask & ~valid_mask.shift(-1, fill_value=False)]
+                        for s, e in zip(starts, ends):
+                            ax3.axvspan(s, e, alpha=0.08, color=color)
+        else:
+            ax3.text(0.5, 0.5, 'Funding rate not available',
+                     transform=ax3.transAxes, ha='center', va='center', color='gray')
+
+        ax3.grid(True, alpha=0.15, color='white')
+
+        plt.tight_layout()
+        hmm_path = os.path.join(DESKTOP, "ema_195_hmm_regimes.png")
+        plt.savefig(hmm_path, dpi=150, bbox_inches='tight', facecolor='#0f0f0f')
+        print(f"\n  📊 HMM Chart: {hmm_path}")
+        plt.show()
+
+    except Exception as e:
+        print(f"  ⚠️  HMM chart error: {e}")
+        import traceback; traceback.print_exc()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

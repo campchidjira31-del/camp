@@ -54,32 +54,32 @@ START_DATE      = "2024-01-01"
 END_DATE        = "2026-01-01"
 INITIAL_CAPITAL = 2500
 RISK_PER_TRADE  = 0.02              # 2% ต่อเทรด
-LEVERAGE        = 6                 # 1 = Spot, 6 = Futures x6
-RR_RATIOS       = [4, 8, 10, 12, 15]
+LEVERAGE        = 1                # 1 = Spot, 6 = Futures x6
+RR_RATIOS       = [1, 2, 3, 5, 10]
 
 # Direction filter
 LONG_ONLY       = False             # True = LONG only, False = LONG + SHORT
 
 # TF เล็ก — ใช้ 4H (ไม่ดู EMA ใน TF นี้)
-SMALL_TF        = '1h'              # '1h' หรือ '4h'
+SMALL_TF        = '15m'              # '1h' หรือ '4h'
 
 # RSI
-RSI_PERIOD      = 14
-RSI_BULL_MAX    = 75                # LONG: RSI ≤ ค่านี้
-RSI_BEAR_MIN    = 25                # SHORT: RSI ≥ ค่านี้
+RSI_PERIOD      = 2
+RSI_BULL_MAX    = 30                # LONG: RSI ≤ ค่านี้
+RSI_BEAR_MIN    = 70                # SHORT: RSI ≥ ค่านี้
 
 # RSI-MA (เส้นสีเหลือง)
 RSI_MA_PERIOD   = 14                # MA period ของ RSI
 RSI_MA_TYPE     = "SMA"             # "SMA" หรือ "EMA"
 
 # RSI-MA Zone Filter (เปิด/ปิดได้)
-RSI_MA_FILTER   = True              # True = เปิดใช้ RSI-MA zone filter
+RSI_MA_FILTER   = False              # True = เปิดใช้ RSI-MA zone filter
                                     # LONG:  RSI ต้องอยู่ใต้ RSI-MA (reversal จาก oversold zone)
                                     # SHORT: RSI ต้องอยู่เหนือ RSI-MA (reversal จาก overbought zone)
                                     # False = ไม่สน RSI-MA zone (เหมือน v9 เดิม)
 
 # EMA (1D trend) — ปรับ period ได้
-EMA_PERIOD      = 65                # ลอง 20, 50, 100, 200
+EMA_PERIOD      = 100                # ลอง 20, 50, 100, 200
 
 # Trade management
 MAX_BARS        = 10000
